@@ -8,6 +8,7 @@ from datetime import datetime
 
 from . import __version__, a11y, privacy, store
 from .adapters import adapter_for
+from .adapters.terminal import resume_argv
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, read_proc, spawn,
                     user_files)
 from .shell import Shell
@@ -251,7 +252,7 @@ def restore(kid):
         # wait for relaunched windows
         deadline = time.time() + WINDOW_WAIT
         while any(i["_win"] is None and i["launched"] for i in items) and time.time() < deadline:
-            time.sleep(0.5)
+            time.sleep(0.2)
             for c in shell.windows():
                 if c["seq"] in known:
                     continue
@@ -260,19 +261,23 @@ def restore(kid):
                         i["_win"] = c
                         known.add(c["seq"])
                         break
-        time.sleep(1.0)
+        if any(i["launched"] for i in items):
+            time.sleep(0.3)  # let new windows finish mapping before they are moved
 
-        # put windows back and re-apply app state
+        # put every window back first, so the desktop looks right at once; app state follows
         for i in items:
-            st, ad, win = i["_st"], i["_ad"], i["_win"]
-            w = st["window"]
+            w, win = i["_st"]["window"], i["_win"]
             if win is None:
                 if i["launched"]:
                     i["status"] = "window did not appear"
                     i["notes"].append(f"no window within {WINDOW_WAIT}s")
-                continue
-            if not w.get("fullscreen"):  # fullscreen windows (e.g. a slideshow) are recreated by the app
+            elif not w.get("fullscreen"):  # fullscreen windows (e.g. a slideshow) are recreated by the app
                 shell.move_resize(win["seq"], w["rect"], w["maximized"])
+
+        for i in items:
+            st, ad, win = i["_st"], i["_ad"], i["_win"]
+            if win is None:
+                continue
             try:
                 i["actions"] += ad.apply(st, win, shell)
             except Exception as e:
@@ -288,11 +293,19 @@ def restore(kid):
                     if got or not st["ui"].get("carets"):
                         i["actions"] += got
                         break
-                    time.sleep(0.5)
+                    time.sleep(0.3)
             tabs = (st["app_state"] or {}).get("tabs", []) if isinstance(st["app_state"], dict) else []
             for t in tabs:
-                if isinstance(t, dict) and t.get("running") and t.get("cwd") is not None \
-                        and not re.fullmatch(r"-?(ba|z|fi)?sh", os.path.basename(t["running"].split()[0])):
+                if not (isinstance(t, dict) and t.get("running") and t.get("cwd") is not None) \
+                        or re.fullmatch(r"-?(ba|z|fi)?sh", os.path.basename(t["running"].split()[0])):
+                    continue
+                argv = resume_argv(t["running"], t.get("claude_session"))
+                if argv and i["launched"]:
+                    i["actions"].append(f"resumed Claude Code session {argv[-1]} in {t['cwd']}")
+                elif argv:
+                    i["notes"].append(f"Claude Code session {argv[-1]} was open in {t['cwd']}; "
+                                      f"the terminal is still open, so it was not started again")
+                else:
                     i["notes"].append(f"was running in {t['cwd']}: {t['running']} (not re-run)")
             if st.get("unsaved"):
                 i["notes"].append("had unsaved changes when saved; check the app's own draft recovery")

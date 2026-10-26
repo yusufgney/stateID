@@ -86,7 +86,7 @@ You can then say *"continue from DK-7SZKSJV0"* or *"save my desktop"* to the age
 | Every app | Title, position, size, workspace, screenshot, working directory. Open documents, found from the process, the window title and GNOME's recent files. Pressed tool buttons, selected tabs, scroll positions, text fields, and the text cursor (line and column), all read from the accessibility tree. |
 | OnlyOffice | Every open document and which one is active. Current slide or page, toolbar tab, selected pen with its colour and size, eraser. A running slideshow with its slide, pen or highlighter, and colour. |
 | Brave, Chrome, Chromium | All tabs of the window with their URLs and which one is active. Read from the browser's own session file, so no browser extension is needed. |
-| Ptyxis, GNOME Terminal | Each tab's directory, the command running in it, and the text on screen. |
+| Ptyxis, GNOME Terminal | Each tab's directory, the command running in it, and the text on screen. A Claude Code session open in a tab is resumed with `claude --resume <session id>`. |
 | Nautilus | The folder shown. |
 | Evince | The document and page. |
 | VS Code | The project folder and the active file. |
@@ -97,7 +97,7 @@ On restore, `stateid`:
 - puts each window back in its place;
 - re-applies the saved state, for example going to the page, selecting the pen, starting the slideshow, or moving the cursor.
 
-Commands that were running in terminals are printed, not re-run.
+Other commands that were running in terminals are printed, not re-run.
 
 ## Privacy
 
