@@ -151,19 +151,67 @@ DESKTOP_DIRS = [HOME / ".local/share/applications", Path("/usr/share/application
                 HOME / ".local/share/flatpak/exports/share/applications"]
 
 
-def find_desktop(app_id):
-    if not app_id:
+def environ(pid):
+    raw = read_proc(pid, "environ")
+    return dict(kv.split("=", 1) for kv in raw.split("\0") if "=" in kv) if raw else {}
+
+
+def launch_argv(pid, cmd, cwd):
+    """(command, working directory) that still work after the app exits.
+
+    An AppImage runs from a temporary mount (/tmp/.mount_*) that disappears with it: use the
+    .AppImage file itself and the directory it was started from. Relative program paths become
+    absolute."""
+    env = environ(pid)
+    if env.get("APPIMAGE") and cmd:
+        return [env["APPIMAGE"], *cmd[1:]], env.get("OWD") or str(HOME)
+    if cmd and "/" in cmd[0] and not os.path.isabs(cmd[0]):
+        exe = read_proc(pid, "exe")
+        cmd = [exe if exe and not exe.endswith(" (deleted)") else os.path.join(cwd or "", cmd[0]), *cmd[1:]]
+    return cmd, cwd
+
+
+def _desktop_entries():
+    for d in DESKTOP_DIRS:
+        try:
+            yield from sorted(d.glob("*.desktop"))
+        except OSError:
+            continue
+
+
+def find_desktop(app_id, wm_class=None):
+    """The .desktop file for an app id, or, when the window has no app id (e.g. AppImages show up
+    as "window:N"), the one whose StartupWMClass or program name matches the window class."""
+    if app_id:
+        hit = next((str(p / app_id) for p in DESKTOP_DIRS if (p / app_id).exists()), None)
+        if hit:
+            return hit
+    if not wm_class:
         return None
-    return next((str(p / app_id) for p in DESKTOP_DIRS if (p / app_id).exists()), None)
+    want = wm_class.lower()
+    by_exec = None
+    for path in _desktop_entries():
+        kf = GLib.KeyFile()
+        try:
+            kf.load_from_file(str(path), GLib.KeyFileFlags.NONE)
+            keys = kf.get_keys("Desktop Entry")[0]
+            if "StartupWMClass" in keys and kf.get_string("Desktop Entry", "StartupWMClass").lower() == want:
+                return str(path)
+            prog = os.path.basename(shlex.split(kf.get_string("Desktop Entry", "Exec"))[0]).lower()
+        except (GLib.Error, ValueError, IndexError):
+            continue
+        if by_exec is None and (prog == want or prog.split(".")[0] == want):
+            by_exec = str(path)
+    return by_exec
 
 
-def desktop_command(app_id, files):
+def desktop_command(app_id, files, wm_class=None):
     """The app's own Exec line with the documents filled in.
 
     Running Exec directly (instead of D-Bus activation, which `gio launch` uses for
     DBusActivatable apps) always opens a window, even when the app has no document.
     """
-    path = find_desktop(app_id)
+    path = find_desktop(app_id, wm_class)
     if not path:
         return None
     kf = GLib.KeyFile()

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -9,8 +10,8 @@ from datetime import datetime
 from . import __version__, a11y, privacy, store
 from .adapters import adapter_for
 from .adapters.terminal import resume_argv
-from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, read_proc, spawn,
-                    user_files)
+from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, launch_argv, read_proc,
+                    spawn, user_files)
 from .shell import Shell
 
 WINDOW_WAIT = 30  # seconds to wait for a relaunched app's window
@@ -102,12 +103,15 @@ def describe_window(w):
     cmd = cmdline(pid) if pid > 0 else []
     cwd = read_proc(pid, "cwd") if pid > 0 else None
     pids = [pid] + descendants(pid, 2) if pid > 0 else []
+    files = files_from_title(w["title"], cwd) + file_arg_docs(cmd) + user_files(pids)
+    if pid > 0:
+        cmd, cwd = launch_argv(pid, cmd, cwd)
     st = {
         "window": w,
         "app": w["app_name"] or w["wm_class"],
         "command": cmd,
         "cwd": cwd,
-        "files": list(dict.fromkeys(files_from_title(w["title"], cwd) + file_arg_docs(cmd) + user_files(pids))),
+        "files": list(dict.fromkeys(files)),
         "unsaved": bool(re.match(r"^\s*[•*●]", w["title"] or "")),
         "app_state": None,
         "restore_cmd": None,
@@ -198,25 +202,42 @@ def save(window=None, focused=False, copy=False, screenshots=True):
                         {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5]} for v in views]}
 
 
+def _runnable(cmd):
+    """Can this saved command still be started? (Programs in temporary or deleted places cannot.)"""
+    if not cmd or "--gapplication-service" in cmd:
+        return False
+    prog = cmd[0]
+    if os.path.isabs(prog):
+        return os.access(prog, os.X_OK)
+    return "/" not in prog and shutil.which(prog) is not None
+
+
 def _launch(st, adapter):
-    """Reopen a closed window. Returns (launched command lines, notes)."""
-    launched = adapter.launch(st)
-    if launched:
-        return launched, []
-    if st.get("restore_cmd"):
-        launched = [spawn(st["restore_cmd"], st["cwd"])]
-        for extra in st.get("restore_more", []):
-            time.sleep(1.0)
-            launched.append(spawn(extra, st["cwd"]))
-        return launched, []
-    docs = [f for f in st["files"] if os.path.exists(f)][:5] or files_from_title(st["window"]["title"], st["cwd"])
-    cmd = desktop_command(st["window"]["app_id"], docs)
-    if cmd:
-        notes = [] if docs else ["no document was recorded for this window; the app opens empty (see the screenshot)"]
-        return [spawn(cmd, st["cwd"])], notes
-    if st["command"] and "--gapplication-service" not in st["command"]:
-        return [spawn(st["command"], st["cwd"])], []
-    return [], ["cannot reopen: no launcher found for this app"]
+    """Reopen a closed window. Returns (launched command lines, notes); never raises for a
+    program that cannot be started, so one broken window does not stop the others."""
+    notes = []
+    try:
+        launched = adapter.launch(st)
+        if launched:
+            return launched, []
+        if st.get("restore_cmd") and _runnable(st["restore_cmd"]):
+            launched = [spawn(st["restore_cmd"], st["cwd"])]
+            for extra in st.get("restore_more", []):
+                time.sleep(1.0)
+                launched.append(spawn(extra, st["cwd"]))
+            return launched, []
+        w = st["window"]
+        docs = [f for f in st["files"] if os.path.exists(f)][:5] or files_from_title(w["title"], st["cwd"])
+        cmd = desktop_command(w["app_id"], docs, w.get("wm_class"))
+        if cmd and _runnable(cmd):
+            if not docs:
+                notes.append("no document was recorded for this window; the app opens empty (see the screenshot)")
+            return [spawn(cmd, st["cwd"])], notes
+        if _runnable(st["command"]):
+            return [spawn(st["command"], st["cwd"])], []
+    except OSError as e:
+        return [], [f"cannot reopen: {e}"]
+    return [], ["cannot reopen: the program is no longer where it was and no launcher was found"]
 
 
 def _same_app(a, b):
