@@ -34,7 +34,7 @@ what is saved, per window:
   VS Code         project folder and active file
 
 examples:
-  stateid save --copy             snapshot the whole desktop, copy the ID
+  stateid desktop                 save the whole desktop, copy the ID
   stateid save --focused          snapshot only the window you are using
   stateid list                    find an ID
   stateid DK-7SZKSJV0             go back to that moment
@@ -55,6 +55,16 @@ set STATEID_DIR to use another folder."""
 
 def cmd_save(args):
     print(core.save(window=args.window, focused=args.focused, copy=args.copy)["id"])
+
+
+def cmd_desktop(args):
+    result = core.save(copy=not args.no_copy)
+    print(result["id"] + ("" if args.no_copy else "    (copied to the clipboard)"))
+    for w in result["windows"]:
+        print(f"  • {w['app']}" + ("" if w.get("private") else f" — {w['title']}"))
+    if result["excluded_windows"]:
+        print(f"  ({result['excluded_windows']} window(s) skipped by your privacy settings)")
+    print(f"\nGo back to this moment with: stateid {result['id']}")
 
 
 def cmd_restore(args):
@@ -117,6 +127,12 @@ def build_parser():
     g.add_argument("--focused", action="store_true", help="only the window that has the keyboard focus")
     s.add_argument("--copy", action="store_true", help="also copy the ID to the clipboard and show a notification")
     s.set_defaults(fn=cmd_save)
+
+    s = sub.add_parser("desktop", help="save the whole desktop and copy its ID (same as Super+Shift+S)",
+                       description="Snapshot every open window, copy the new state ID to the clipboard and list "
+                                   "what was saved. Same as `stateid save --copy`, with a summary.")
+    s.add_argument("--no-copy", action="store_true", help="do not touch the clipboard; only print the ID")
+    s.set_defaults(fn=cmd_desktop)
 
     s = sub.add_parser("restore", help="bring a saved moment back (shortcut: stateid ID)",
                        description="Reopen what is closed, reuse what is already open, put every window back in "

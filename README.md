@@ -5,8 +5,8 @@ Give the current state of your desktop a short ID, like `DK-7SZKSJV0`, and bring
 The ID stands for what was open and where you were in it: the slide you were on, the selected red pen, the browser tabs, the folder, the terminal directories and the line your cursor was on. Paste the ID into a terminal to restore it, or give it to an AI agent so it can read what you were doing and carry on.
 
 ```
-$ stateid save --copy
-DK-7SZKSJV0                      # also on the clipboard
+$ stateid desktop
+DK-7SZKSJV0    (copied to the clipboard)
 
 $ stateid DK-7SZKSJV0            # later: reopen and restore everything
 • ONLYOFFICE — lecture.pptx — ONLYOFFICE
@@ -40,11 +40,12 @@ You can get an ID in three ways:
 |---|---|
 | Any window | Right-click the title bar, or **Super + right-click** anywhere inside the window, and choose **Copy state ID of this window** or **Copy state ID of the whole desktop** |
 | Keyboard | **Super+Shift+S** saves the whole desktop |
-| Terminal | `stateid save --copy` |
+| Terminal | `stateid desktop` |
 
 The ID goes to the clipboard and a notification shows it.
 
 ```
+stateid desktop             save the whole desktop and copy the ID
 stateid save [--window SEQ | --focused] [--copy]   snapshot, print a new ID
 stateid restore ID          bring the moment back (shortcut: stateid ID)
 stateid show ID             the summary an agent should read (AGENT.md)
