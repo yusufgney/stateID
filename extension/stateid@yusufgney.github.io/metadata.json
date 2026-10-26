@@ -1,0 +1,8 @@
+{
+  "uuid": "stateid@yusufgney.github.io",
+  "name": "stateid",
+  "description": "Give the current state of your windows an ID and restore it later. Right-click a title bar (or Super + right-click inside a window) and choose \"Copy state ID\". Works with the `stateid` command.",
+  "url": "https://github.com/yusufgney/stateid",
+  "shell-version": ["50"],
+  "version": 1
+}
