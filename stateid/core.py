@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime
 
-from . import __version__, a11y, store
+from . import __version__, a11y, privacy, store
 from .adapters import adapter_for
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, read_proc, spawn,
                     user_files)
@@ -17,14 +17,83 @@ WINDOW_WAIT = 30  # seconds to wait for a relaunched app's window
 _lock = threading.RLock()
 
 
-def _summary(w):
-    return {"seq": w["seq"], "app": w["app_name"] or w["wm_class"], "title": w["title"], "focused": w["focused"],
+def _summary(w, cfg):
+    p = cfg["privacy"]
+    fields = privacy.window_fields(w)
+    hidden = "excluded" if privacy.matches(p["exclude"], *fields) else \
+        "private" if privacy.matches(p["private"], *fields) else None
+    title = f"[{hidden} window]" if hidden else (privacy.redact(w["title"]) if p["redact"] else w["title"])
+    return {"seq": w["seq"], "app": w["app_name"] or w["wm_class"], "title": title, "focused": w["focused"],
             "minimized": w["minimized"], "workspace": w["workspace"]}
 
 
 def list_windows():
+    """Windows open right now, as an agent may see them (private and excluded titles hidden)."""
+    cfg = privacy.load()
     with _lock:
-        return [_summary(w) for w in Shell().windows()]
+        return [_summary(w, cfg) for w in Shell().windows()]
+
+
+def is_private(st, cfg):
+    """Private if it was private when saved or matches the current settings (settings can only add privacy)."""
+    return bool(st.get("private")) or privacy.matches(cfg["privacy"]["private"], *privacy.window_fields(st["window"]))
+
+
+def agent_view(st, cfg):
+    """What an agent may see of a saved window: private windows reduced to their app, secrets masked."""
+    p = cfg["privacy"]
+    w = st["window"]
+    if is_private(st, cfg):
+        return {"app": st["app"], "private": True,
+                "window": {k: w[k] for k in ("workspace", "focused", "maximized", "minimized", "rect")}}
+    v = json.loads(json.dumps(st))  # deep copy
+    a = v.get("app_state")
+    if isinstance(a, dict) and isinstance(a.get("tabs"), list):
+        a["tabs"] = [{"title": "[private tab]", "url": "[private tab]", "private": True}
+                     if isinstance(t, dict) and "url" in t
+                     and (t.get("private") or privacy.matches(p["private_tabs"], t.get("title"), t.get("url")))
+                     else t for t in a["tabs"]]
+    if not p["terminal_text"]:
+        (v.get("ui") or {}).pop("terminals", None)
+        if isinstance(a, dict):
+            a.pop("screen", None)
+    v.pop("restore_cmd", None)
+    v.pop("restore_more", None)
+    if p["redact"]:
+        for key in ("app_state", "ui", "command", "files", "cwd"):
+            v[key] = privacy.redact_deep(v.get(key))
+        v["window"]["title"] = privacy.redact(w["title"])
+    return v
+
+
+def summary(kid):
+    """The agent summary of a state, rendered with the current privacy settings."""
+    cfg = privacy.load()
+    data = store.load(kid)
+    views = [agent_view(st, cfg) for st in data["windows"]]
+    return store.agent_md(data["id"], views, data["created"], data.get("excluded", []))
+
+
+def _lock_down(path):
+    """States hold screenshots and terminal text: readable by the user only."""
+    os.chmod(path, 0o700)
+    for f in path.iterdir():
+        os.chmod(f, 0o600)
+
+
+def prune(keep_days):
+    """Delete states older than keep_days (0 keeps everything). Returns the deleted IDs."""
+    if not keep_days or keep_days <= 0:
+        return []
+    cutoff = datetime.now().timestamp() - keep_days * 86400
+    gone = []
+    for row in store.list_states(limit=None):
+        try:
+            if datetime.fromisoformat(row["created"]).timestamp() < cutoff:
+                gone.append(store.delete(row["id"]))
+        except (ValueError, store.StateNotFound):
+            continue
+    return gone
 
 
 def describe_window(w):
@@ -53,8 +122,32 @@ def describe_window(w):
     return st
 
 
+def _apply_privacy(st, cfg):
+    """Mark private windows and tabs; drop or mask terminal text according to the settings."""
+    p = cfg["privacy"]
+    st["private"] = privacy.matches(p["private"], *privacy.window_fields(st["window"]))
+    a = st.get("app_state")
+    if isinstance(a, dict) and isinstance(a.get("tabs"), list):
+        for t in a["tabs"]:
+            if isinstance(t, dict) and "url" in t and privacy.matches(p["private_tabs"], t.get("title"), t.get("url")):
+                t["private"] = True
+    ui = st.get("ui") or {}
+    if not p["terminal_text"]:
+        ui.pop("terminals", None)
+        if isinstance(a, dict):
+            a.pop("screen", None)
+    elif p["redact"]:  # the screen text is only for agents; never keep secrets from it on disk
+        for t in ui.get("terminals", []):
+            t["text"] = privacy.redact(t["text"])
+        if isinstance(a, dict) and a.get("screen"):
+            a["screen"] = privacy.redact(a["screen"])
+
+
 def save(window=None, focused=False, copy=False, screenshots=True):
-    """Snapshot windows (all, one by sequence number, or the focused one). Returns the new state's summary."""
+    """Snapshot windows (all, one by sequence number, or the focused one). Returns the new state's summary,
+    already filtered for agents."""
+    cfg = privacy.load()
+    p = cfg["privacy"]
     with _lock:
         shell = Shell()
         wins = shell.windows()
@@ -66,28 +159,42 @@ def save(window=None, focused=False, copy=False, screenshots=True):
             wins = [w for w in wins if w["focused"]]
         if not wins:
             raise LookupError("No matching window")
+        excluded = [w for w in wins if privacy.matches(p["exclude"], *privacy.window_fields(w))]
+        wins = [w for w in wins if w not in excluded]
+        if not wins:
+            raise LookupError("Every matching window is excluded by the privacy settings "
+                              f"({privacy.CONFIG_PATH})")
         kid = store.new_id()
+        store.STORE.mkdir(parents=True, exist_ok=True)
+        os.chmod(store.STORE, 0o700)
         d = store.STORE / kid
-        d.mkdir(parents=True)
+        d.mkdir(mode=0o700)
         states = []
         for i, w in enumerate(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"]))):
             st = describe_window(w)
+            _apply_privacy(st, cfg)
             png = f"window{i + 1}.png"
-            if screenshots and shell.capture(w["seq"], d / png):
+            if screenshots and p["screenshots"] and shell.capture(w["seq"], d / png):
                 st["screenshot"] = png
             states.append(st)
         created = datetime.now().isoformat(timespec="seconds")
         scope = "window" if window is not None or focused else "desktop"
+        excluded_apps = [w["app_name"] or w["wm_class"] for w in excluded]
         (d / "state.json").write_text(json.dumps(
-            {"id": kid, "version": __version__, "created": created, "scope": scope, "windows": states},
-            ensure_ascii=False, indent=1))
-        (d / "AGENT.md").write_text(store.agent_md(kid, states, created))
+            {"id": kid, "version": __version__, "created": created, "scope": scope, "excluded": excluded_apps,
+             "windows": states}, ensure_ascii=False, indent=1))
+        views = [agent_view(st, cfg) for st in states]
+        (d / "AGENT.md").write_text(store.agent_md(kid, views, created, excluded_apps))
+        _lock_down(d)
         if copy:
             shell.copy(kid)
             names = ", ".join(s["app"] or "?" for s in states[:3]) + ("…" if len(states) > 3 else "")
             shell.notify(f"State ID copied: {kid}", f"{len(states)} window(s): {names}")
-        return {"id": kid, "created": created, "scope": scope,
-                "windows": [{"app": s["app"], "title": s["window"]["title"], "files": s["files"][:5]} for s in states]}
+    pruned = prune(cfg["storage"]["keep_days"])
+    return {"id": kid, "created": created, "scope": scope, "excluded_windows": len(excluded_apps),
+            "pruned_old_states": len(pruned),
+            "windows": [{"app": v["app"], "private": True} if v.get("private") else
+                        {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5]} for v in views]}
 
 
 def _launch(st, adapter):
@@ -196,14 +303,39 @@ def restore(kid):
     for i in items:
         for k in ("_st", "_ad", "_win"):
             i.pop(k)
-    return {"id": data["id"], "windows": items, "agent_summary": str(store.path(kid) / "AGENT.md")}
+    return {"id": data["id"], "windows": items}
+
+
+def agent_safe_report(report):
+    """A restore report fit for an agent: private windows anonymised, launch commands summarised
+    (a browser command line holds every tab URL), the rest redacted."""
+    cfg = privacy.load()
+    data = store.load(report["id"])
+    out = []
+    for st, item in zip(data["windows"], report["windows"]):
+        if is_private(st, cfg):
+            out.append({"app": item["app"], "private": True, "status": item["status"]})
+            continue
+        r = dict(item, title=privacy.redact(item["title"]))
+        r["launched"] = [line.split(" ", 1)[0] + (" …" if " " in line else "") for line in item["launched"]]
+        r["actions"] = [privacy.redact(a) for a in item["actions"]]
+        r["notes"] = [privacy.redact(n) for n in item["notes"]]
+        out.append(r)
+    return {"id": report["id"], "windows": out}
 
 
 def screenshots(kid, max_width=1280):
-    """[(window number, app, title, jpeg bytes)] for a saved state."""
+    """[(window number, app, title, jpeg bytes)] an agent may see: none for private windows,
+    none at all when agent_screenshots is off."""
+    cfg = privacy.load()
     data = store.load(kid)
+    if not cfg["privacy"]["agent_screenshots"]:
+        return []
     out = []
     for n, st in enumerate(data["windows"], 1):
+        if is_private(st, cfg):
+            continue
         if st.get("screenshot") and (img := store.screenshot(kid, st["screenshot"], max_width)):
-            out.append((n, st["app"], st["window"]["title"], img))
+            title = privacy.redact(st["window"]["title"]) if cfg["privacy"]["redact"] else st["window"]["title"]
+            out.append((n, st["app"], title, img))
     return out

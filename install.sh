@@ -34,6 +34,9 @@ else
     "$REPO/.venv/bin/pip" install -q -e "$REPO"
 fi
 
+# saved states hold screenshots and terminal text: keep them readable by this user only
+[[ -d "$HOME/.local/share/stateid" ]] && chmod -R go-rwx "$HOME/.local/share/stateid"
+
 say "Installing the commands -> $BIN_DIR/stateid, $BIN_DIR/stateid-mcp"
 mkdir -p "$BIN_DIR"
 ln -sfn "$REPO/.venv/bin/stateid" "$BIN_DIR/stateid"

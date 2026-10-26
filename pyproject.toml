@@ -14,6 +14,9 @@ authors = [{ name = "yusufgney" }]
 # gir1.2-gdkpixbuf-2.0. install.sh creates a virtualenv with --system-site-packages for that reason.
 dependencies = ["mcp>=2.3,<3", "websockets>=12"]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.urls]
 Homepage = "https://github.com/yusufgney/stateID"
 
@@ -26,3 +29,9 @@ packages = ["stateid", "stateid.adapters"]
 
 [tool.setuptools.dynamic]
 version = { attr = "stateid.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The virtualenv sees system packages (for PyGObject); keep ROS's pytest plugins out if they are installed.
+addopts = """-p no:launch_testing -p no:launch_ros -p no:ament_copyright -p no:ament_flake8 -p no:ament_lint
+             -p no:ament_pep257 -p no:ament_xmllint -p no:colcon_core_warnings_stderr"""

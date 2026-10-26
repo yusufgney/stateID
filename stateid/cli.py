@@ -2,7 +2,9 @@
 import argparse
 import sys
 
-from . import __version__, core, store
+import json
+
+from . import __version__, core, privacy, store
 from .shell import ShellUnavailable
 
 DESCRIPTION = """\
@@ -38,6 +40,12 @@ examples:
   stateid DK-7SZKSJV0             go back to that moment
   stateid show DK-7SZKSJV0        what an agent should read to continue
 
+privacy: password managers and private/incognito windows are never captured;
+  `stateid config --init` writes ~/.config/stateid/config.toml where you can
+  exclude more apps, hide windows or browser tabs from agents, turn off
+  screenshots or terminal text and delete old states automatically.
+  Secrets (tokens, passwords, keys) are masked in everything agents read.
+
 AI agents: `stateid-mcp` is an MCP server with the same features, e.g.
   claude mcp add --scope user stateid -- stateid-mcp
 
@@ -60,11 +68,11 @@ def cmd_restore(args):
             print("  restored: " + "; ".join(w["actions"]))
         for note in w["notes"]:
             print(f"  note: {note}")
-    print(f"\nAgent summary: {report['agent_summary']}")
+    print(f"\nAgent summary: stateid show {report['id']}")
 
 
 def cmd_show(args):
-    print(store.agent_summary(args.id))
+    print(core.summary(args.id))
 
 
 def cmd_list(args):
@@ -79,6 +87,18 @@ def cmd_list(args):
 def cmd_delete(args):
     for kid in args.id:
         print("deleted:", store.delete(kid))
+
+
+def cmd_config(args):
+    if args.init:
+        if privacy.init_config():
+            print(f"wrote {privacy.CONFIG_PATH}; edit it to choose what is excluded or kept private")
+        else:
+            print(f"{privacy.CONFIG_PATH} already exists; not overwritten")
+        return
+    exists = privacy.CONFIG_PATH.exists()
+    print(f"# {privacy.CONFIG_PATH}" + ("" if exists else " (not created yet: defaults below; `stateid config --init`)"))
+    print(json.dumps(privacy.load(), indent=2))
 
 
 def build_parser():
@@ -119,6 +139,13 @@ def build_parser():
     s = sub.add_parser("delete", help="delete saved states", description="Delete one or more saved states.")
     s.add_argument("id", nargs="+", help="state IDs")
     s.set_defaults(fn=cmd_delete)
+
+    s = sub.add_parser("config", help="show the privacy and storage settings",
+                       description="Show the effective settings from ~/.config/stateid/config.toml: windows never "
+                                   "captured (exclude), windows hidden from agents (private), private browser tabs, "
+                                   "screenshots, terminal text, secret redaction and automatic clean-up.")
+    s.add_argument("--init", action="store_true", help="write a commented config file to start from")
+    s.set_defaults(fn=cmd_config)
     return p
 
 
@@ -133,7 +160,7 @@ def main():
         return
     try:
         args.fn(args)
-    except (ShellUnavailable, store.StateNotFound, LookupError) as e:
+    except (ShellUnavailable, store.StateNotFound, LookupError, privacy.ConfigError) as e:
         sys.exit(str(e))
 
 

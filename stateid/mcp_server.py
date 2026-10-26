@@ -9,7 +9,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import __version__, core, store
+from . import __version__, core, privacy, store
 from .shell import ShellUnavailable
 
 INSTRUCTIONS = """\
@@ -21,8 +21,10 @@ directories, text cursor positions and window placement, plus a screenshot of ev
   and read the summary and screenshots before doing anything else.
 - Call list_windows or save_state to see what the user is doing right now.
 - restore_state reopens and rearranges the user's windows: only call it when the user asks.
-- Screenshots and terminal text can contain private information; do not repeat more of it
-  than the task needs."""
+- The user's privacy settings hide some windows ("private window") and mask secrets as
+  [REDACTED]. Respect that: do not try to work around it or guess hidden content.
+- Screenshots and terminal text can still contain personal information; do not repeat more
+  of it than the task needs."""
 
 mcp = MCPServer("stateid", title="stateid", version=__version__, instructions=INSTRUCTIONS,
                 website_url="https://github.com/yusufgney/stateID")
@@ -32,7 +34,7 @@ def expected_errors():
     """Errors the model should see and can act on (unknown ID, extension not loaded, no such window)."""
     try:
         yield
-    except (store.StateNotFound, ShellUnavailable, LookupError) as e:
+    except (store.StateNotFound, ShellUnavailable, LookupError, privacy.ConfigError) as e:
         raise ToolError(str(e)) from e
 
 
@@ -71,7 +73,7 @@ def get_state(state_id: str, include_screenshots: bool = True, max_screenshots: 
     terminal directories and screen text, text cursor) followed by up to `max_screenshots`
     screenshots, focused window first. Use it to continue the user's work from that moment."""
     with expected_errors():
-        out: list = [store.agent_summary(state_id)]
+        out: list = [core.summary(state_id)]
         if include_screenshots:
             for n, app, title, jpeg in core.screenshots(state_id)[:max(0, max_screenshots)]:
                 out += [f"Screenshot of window {n}: {app} — {title}", Image(data=jpeg, format="jpeg")]
@@ -92,7 +94,7 @@ def restore_state(state_id: str) -> dict:
     back in place and re-apply app state (page, pen, slideshow, tabs, cursor). Visible to the user
     and can take up to a minute; only call it when the user asks. Terminal commands are not re-run."""
     with expected_errors():
-        return core.restore(state_id)
+        return core.agent_safe_report(core.restore(state_id))
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True,
@@ -112,7 +114,7 @@ def states_resource() -> list[dict]:
 @mcp.resource("stateid://states/{state_id}", name="state", mime_type="text/markdown",
               description="The agent summary (AGENT.md) of one saved state")
 def state_resource(state_id: str) -> str:
-    return store.agent_summary(state_id)
+    return core.summary(state_id)
 
 
 @mcp.prompt(title="Continue from a state ID")

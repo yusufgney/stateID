@@ -11,6 +11,8 @@ import gi
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, GLib  # noqa: E402
 
+from . import privacy
+
 STORE = Path(os.environ.get("STATEID_DIR", Path.home() / ".local/share/stateid"))
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
 ID_RE = re.compile(r"^DK-[0-9A-Z]{8}$")
@@ -47,12 +49,10 @@ def load(kid):
     return json.loads(f.read_text())
 
 
-def agent_summary(kid):
-    load(kid)  # raises a clear error for unknown IDs
-    return (path(kid) / "AGENT.md").read_text()
-
-
 def list_states(limit=20):
+    """Saved states, newest first; titles of private windows are hidden."""
+    cfg = privacy.load()
+    hidden = lambda s: s.get("private") or privacy.matches(cfg["privacy"]["private"], *privacy.window_fields(s["window"]))
     rows = []
     for f in STORE.glob("DK-*/state.json"):
         try:
@@ -60,7 +60,8 @@ def list_states(limit=20):
         except Exception:
             continue
         rows.append({"id": d["id"], "created": d["created"], "scope": d.get("scope", "desktop"),
-                     "windows": [{"app": s["app"], "title": s["window"]["title"]} for s in d["windows"]]})
+                     "windows": [{"app": s["app"], "private": True} if hidden(s) else
+                                 {"app": s["app"], "title": privacy.redact(s["window"]["title"])} for s in d["windows"]]})
     rows.sort(key=lambda r: r["created"], reverse=True)
     return rows[:limit]
 
@@ -92,12 +93,20 @@ def screenshot(kid, name, max_width=1280, quality=80):
     return bytes(data) if ok else None
 
 
-def agent_md(kid, states, created):
+def agent_md(kid, states, created, excluded=()):
+    """Markdown summary for agents. `states` must already be agent views (see core.agent_view)."""
     lines = [f"# State {kid}", "",
-             f"Saved {created}. This is the user's desktop at that moment. Each window has a screenshot "
-             "(`windowN.png`) in this folder; look at it for anything not captured as data.", "",
+             f"Saved {created}. This is the user's desktop at that moment. Windows have screenshots "
+             "(`windowN.png`) in this folder; look at them for anything not captured as data.", "",
              f"Restore with: `stateid restore {kid}`", ""]
+    if excluded:
+        lines += [f"{len(excluded)} window(s) were not captured because of the user's privacy settings.", ""]
     for i, st in enumerate(states, 1):
+        if st.get("private"):
+            lines += [f"## {i}. {st['app']} — private window", "",
+                      "- Hidden by the user's privacy settings; restore still brings it back. "
+                      "Do not try to find out what it contains.", ""]
+            continue
         w, r = st["window"], st["window"]["rect"]
         lines += [f"## {i}. {st['app']} — {w['title']}", ""]
         lines.append(f"- Placement: workspace {w['workspace']}, {r['width']}x{r['height']} at {r['x']},{r['y']}"

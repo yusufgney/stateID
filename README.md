@@ -50,6 +50,7 @@ stateid restore ID          bring the moment back (shortcut: stateid ID)
 stateid show ID             the summary an agent should read (AGENT.md)
 stateid list [-n N]         saved states, newest first
 stateid delete ID...        delete saved states
+stateid config [--init]     show the privacy settings (--init writes a config file)
 stateid --help              full help; every command also has --help
 ```
 
@@ -71,6 +72,8 @@ Any MCP client works the same way: the command is `~/.local/bin/stateid-mcp`, wi
 | `list_states` | Saved states, newest first | read-only |
 | `restore_state` | Bring a state back on screen | opens and moves windows |
 | `delete_state` | Delete a state | destructive |
+
+Everything the server returns goes through the privacy settings below.
 
 The server also exposes the resources `stateid://states` and `stateid://states/{id}`, and a prompt, `continue_from_state`.
 
@@ -96,13 +99,32 @@ On restore, `stateid`:
 
 Commands that were running in terminals are printed, not re-run.
 
+## Privacy
+
+Every state is stored in your home folder, readable by you only (`700`/`600`). Settings live in `~/.config/stateid/config.toml`; `stateid config --init` writes a commented starting file and `stateid config` shows what is in effect.
+
+| Setting | Effect |
+|---|---|
+| `exclude` | Windows that are **never captured**: no screenshot, nothing on disk. The default list covers KeePassXC, Bitwarden, 1Password, Passwords and Keys, and private or incognito browser windows. |
+| `private` | Windows that are captured, so `restore` still brings them back, but **hidden from agents**. An agent only learns that a private window of that app was open. |
+| `private_tabs` | Browser tabs, matched by title or URL, that are hidden from agents. The tab is still restored. |
+| `screenshots` / `agent_screenshots` | Turn screenshots off completely, or keep them on disk but never send them to an agent. |
+| `terminal_text` | Whether the text on terminal screens is kept. |
+| `redact` | Mask anything that looks like a secret in what agents read: tokens (GitHub, OpenAI and Anthropic, Slack, AWS, Google, JWT), `password=`-style values, private keys, credentials in URLs, and sensitive URL parameters. |
+| `keep_days` | Delete states older than this many days on every save; `0` keeps them forever. |
+
+Patterns are plain words, which match anywhere, or globs. They are matched against the app id, the window class, the app name and the window title, for example `private = ["whatsapp", "*bank*"]`.
+
+The agent's view is built from the current settings every time it reads a state. A window you mark private today is also hidden in older states. Relaxing a setting later does not reveal a window that was private when it was saved.
+
 ## How it works
 
 - **`extension/`** is a small GNOME Shell extension. It adds the window-menu items and exposes a D-Bus interface at `io.github.yusufgney.StateId`. The interface lists windows, takes screenshots, moves windows and uses the clipboard; on Wayland, only the compositor can do these things.
 - **`stateid/`** is the Python package that does the rest:
   - `core.py` holds save, restore and inspect;
   - `cli.py` is the `stateid` command and `mcp_server.py` is `stateid-mcp`, both thin layers over `core.py`;
-  - `adapters/` has one module per app, `a11y.py` reads the accessibility tree, and `store.py` handles the saved states.
+  - `adapters/` has one module per app, `a11y.py` reads the accessibility tree, and `store.py` handles the saved states;
+  - `privacy.py` loads the settings and masks secrets; every summary, listing and report an agent receives passes through it.
 
   Each app is read in the way that app allows:
   - The **accessibility tree** (AT-SPI) works for any toolkit app.
@@ -116,8 +138,17 @@ States are stored in `~/.local/share/stateid/<ID>/` as `state.json`, `AGENT.md` 
 
 - Anything an app does not expose cannot be restored as data; it stays visible in the screenshot. Examples are the scroll position inside a web page, unsaved form input, and the internal state of Electron apps.
 - Unsaved changes are flagged but not recreated. Apps such as Text Editor and OnlyOffice keep their own drafts.
-- **Privacy:** `get_state` sends window screenshots and terminal text to the model you use. Save only the windows you want to share, for example with `save_state(scope="focused")`.
+- **Privacy:** `get_state` sends window screenshots and terminal text to the model you use. Redaction is pattern-based and cannot catch everything, for example a password visible in a screenshot. Mark sensitive apps as `private`, or save only the window you want to share with `save_state(scope="focused")`.
 - **Security:** the OnlyOffice debug port listens on `127.0.0.1` only, but any program running as your user can use it to control OnlyOffice. Screenshots and terminal text are stored unencrypted in your home folder.
+
+## Development
+
+```bash
+uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/python -m pytest
+```
+
+The tests in `tests/` cover the privacy layer (redaction, matching, what agents see of a saved state) and need no display. Changes to saving and restoring are tested by hand in a separate headless GNOME Shell session (`dbus-run-session -- gnome-shell --headless --wayland --virtual-monitor 1600x900`), so the desktop you are using is never touched.
 
 ## License
 
