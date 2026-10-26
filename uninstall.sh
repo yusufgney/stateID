@@ -7,7 +7,8 @@ UUID="stateid@yusufgney.github.io"
 KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/stateid/"
 
 gnome-extensions disable "$UUID" 2>/dev/null || true
-rm -f "$HOME/.local/bin/stateid" "$HOME/.local/share/gnome-shell/extensions/$UUID"
+rm -f "$HOME/.local/bin/stateid" "$HOME/.local/bin/stateid-mcp" "$HOME/.local/share/gnome-shell/extensions/$UUID"
+command -v claude >/dev/null && claude mcp remove --scope user stateid >/dev/null 2>&1 || true
 
 python3 - "$UUID" "$KEY_PATH" <<'EOF'
 import ast, subprocess, sys

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stateid"
+dynamic = ["version"]
+description = "Give the current state of your GNOME desktop an ID and bring that moment back later; CLI and MCP server"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "yusufgney" }]
+# PyGObject (gi) with Gio, Atspi and GdkPixbuf comes from the system: python3-gi, gir1.2-atspi-2.0,
+# gir1.2-gdkpixbuf-2.0. install.sh creates a virtualenv with --system-site-packages for that reason.
+dependencies = ["mcp>=2.3,<3", "websockets>=12"]
+
+[project.urls]
+Homepage = "https://github.com/yusufgney/stateID"
+
+[project.scripts]
+stateid = "stateid.cli:main"
+stateid-mcp = "stateid.mcp_server:main"
+
+[tool.setuptools]
+packages = ["stateid", "stateid.adapters"]
+
+[tool.setuptools.dynamic]
+version = { attr = "stateid.__version__" }

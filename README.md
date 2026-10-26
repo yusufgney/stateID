@@ -20,7 +20,8 @@ $ stateid DK-7SZKSJV0            # later: reopen and restore everything
 ## Requirements
 
 - GNOME Shell 50 on Wayland (Ubuntu 26.04 or similar)
-- `python3-gi`, `gir1.2-atspi-2.0` and `python3-websockets`
+- `python3-gi`, `gir1.2-atspi-2.0` and `gir1.2-gdkpixbuf-2.0` from your distribution
+- `uv` (recommended) or `python3-venv`; the installer creates `.venv` and installs `mcp` and `websockets` into it
 
 ## Install
 
@@ -52,11 +53,28 @@ stateid delete ID...        delete saved states
 stateid --help              full help; every command also has --help
 ```
 
-### Continuing with an AI agent
+## Use it from an AI agent (MCP)
 
-Tell the agent: *"Run `stateid show DK-7SZKSJV0` and continue from there."*
+`stateid-mcp` is an [MCP](https://modelcontextprotocol.io) server (stdio) with the same features. Register it once, for example with Claude Code:
 
-`show` prints a Markdown summary of each window: the documents, the app state, the text on terminal screens, and paths to a screenshot of every window. The agent can look at the screenshots for anything the data does not cover.
+```bash
+claude mcp add --scope user stateid -- ~/.local/bin/stateid-mcp
+```
+
+Any MCP client works the same way: the command is `~/.local/bin/stateid-mcp`, with no arguments.
+
+| Tool | What it does | Side effects |
+|---|---|---|
+| `list_windows` | The windows open right now | read-only |
+| `save_state` | Snapshot the desktop, the focused window or one window; returns the ID | writes a new state |
+| `get_state` | The summary of a state plus window screenshots (scaled JPEG) | read-only |
+| `list_states` | Saved states, newest first | read-only |
+| `restore_state` | Bring a state back on screen | opens and moves windows |
+| `delete_state` | Delete a state | destructive |
+
+The server also exposes the resources `stateid://states` and `stateid://states/{id}`, and a prompt, `continue_from_state`.
+
+You can then say *"continue from DK-7SZKSJV0"* or *"save my desktop"* to the agent. Without MCP, ask the agent to run `stateid show DK-7SZKSJV0`. That prints the same Markdown summary, with paths to the screenshots.
 
 ## What gets saved
 
@@ -81,7 +99,12 @@ Commands that were running in terminals are printed, not re-run.
 ## How it works
 
 - **`extension/`** is a small GNOME Shell extension. It adds the window-menu items and exposes a D-Bus interface at `io.github.yusufgney.StateId`. The interface lists windows, takes screenshots, moves windows and uses the clipboard; on Wayland, only the compositor can do these things.
-- **`bin/stateid`** is a Python script that does the rest. Each app is read in the way that app allows:
+- **`stateid/`** is the Python package that does the rest:
+  - `core.py` holds save, restore and inspect;
+  - `cli.py` is the `stateid` command and `mcp_server.py` is `stateid-mcp`, both thin layers over `core.py`;
+  - `adapters/` has one module per app, `a11y.py` reads the accessibility tree, and `store.py` handles the saved states.
+
+  Each app is read in the way that app allows:
   - The **accessibility tree** (AT-SPI) works for any toolkit app.
   - **OnlyOffice** runs its editor in an embedded Chromium. The installer adds `--remote-debugging-port=9333` to its launcher, so `stateid` can ask the editor which slide and pen are active, and set them again.
   - **Chromium browsers** write every tab to an SNSS session file, which `stateid` parses.
@@ -93,6 +116,7 @@ States are stored in `~/.local/share/stateid/<ID>/` as `state.json`, `AGENT.md` 
 
 - Anything an app does not expose cannot be restored as data; it stays visible in the screenshot. Examples are the scroll position inside a web page, unsaved form input, and the internal state of Electron apps.
 - Unsaved changes are flagged but not recreated. Apps such as Text Editor and OnlyOffice keep their own drafts.
+- **Privacy:** `get_state` sends window screenshots and terminal text to the model you use. Save only the windows you want to share, for example with `save_state(scope="focused")`.
 - **Security:** the OnlyOffice debug port listens on `127.0.0.1` only, but any program running as your user can use it to control OnlyOffice. Screenshots and terminal text are stored unencrypted in your home folder.
 
 ## License

@@ -1,0 +1,142 @@
+"""Saved states on disk: ~/.local/share/stateid/<ID>/{state.json, AGENT.md, windowN.png}."""
+import json
+import os
+import re
+import secrets
+import shutil
+from pathlib import Path
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib  # noqa: E402
+
+STORE = Path(os.environ.get("STATEID_DIR", Path.home() / ".local/share/stateid"))
+ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32
+ID_RE = re.compile(r"^DK-[0-9A-Z]{8}$")
+
+
+class StateNotFound(LookupError):
+    pass
+
+
+def normalize(kid):
+    """Validate an ID (it may come from a model or a user) so it can never escape the store."""
+    kid = (kid or "").strip().upper()
+    if not ID_RE.match(kid):
+        raise StateNotFound(f"Not a state ID: {kid!r} (expected DK- followed by 8 characters)")
+    return kid
+
+
+def new_id():
+    while True:
+        n = secrets.randbits(40)
+        kid = "DK-" + "".join(ALPHABET[(n >> (5 * i)) & 31] for i in range(8))
+        if not (STORE / kid).exists():
+            return kid
+
+
+def path(kid):
+    return STORE / normalize(kid)
+
+
+def load(kid):
+    f = path(kid) / "state.json"
+    if not f.exists():
+        raise StateNotFound(f"No such state: {normalize(kid)} (see `stateid list`)")
+    return json.loads(f.read_text())
+
+
+def agent_summary(kid):
+    load(kid)  # raises a clear error for unknown IDs
+    return (path(kid) / "AGENT.md").read_text()
+
+
+def list_states(limit=20):
+    rows = []
+    for f in STORE.glob("DK-*/state.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        rows.append({"id": d["id"], "created": d["created"], "scope": d.get("scope", "desktop"),
+                     "windows": [{"app": s["app"], "title": s["window"]["title"]} for s in d["windows"]]})
+    rows.sort(key=lambda r: r["created"], reverse=True)
+    return rows[:limit]
+
+
+def delete(kid):
+    load(kid)
+    shutil.rmtree(path(kid))
+    return normalize(kid)
+
+
+def screenshot(kid, name, max_width=1280, quality=80):
+    """A window screenshot scaled down and JPEG-encoded, small enough to hand to a model."""
+    f = path(kid) / name
+    if not re.fullmatch(r"window\d+\.png", name) or not f.exists():
+        return None
+    pb = GdkPixbuf.Pixbuf.new_from_file(str(f))
+    if pb.get_width() > max_width:
+        pb = pb.scale_simple(max_width, round(pb.get_height() * max_width / pb.get_width()),
+                             GdkPixbuf.InterpType.BILINEAR)
+    if pb.get_has_alpha():  # JPEG has no alpha; flatten onto white
+        flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, pb.get_width(), pb.get_height())
+        flat.fill(0xFFFFFFFF)
+        pb.composite(flat, 0, 0, pb.get_width(), pb.get_height(), 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+        pb = flat
+    try:
+        ok, data = pb.save_to_bufferv("jpeg", ["quality"], [str(quality)])
+    except GLib.Error:
+        return None
+    return bytes(data) if ok else None
+
+
+def agent_md(kid, states, created):
+    lines = [f"# State {kid}", "",
+             f"Saved {created}. This is the user's desktop at that moment. Each window has a screenshot "
+             "(`windowN.png`) in this folder; look at it for anything not captured as data.", "",
+             f"Restore with: `stateid restore {kid}`", ""]
+    for i, st in enumerate(states, 1):
+        w, r = st["window"], st["window"]["rect"]
+        lines += [f"## {i}. {st['app']} — {w['title']}", ""]
+        lines.append(f"- Placement: workspace {w['workspace']}, {r['width']}x{r['height']} at {r['x']},{r['y']}"
+                     + (" (maximized)" if w["maximized"] else "") + (" (minimized)" if w["minimized"] else "")
+                     + (" — **focused window**" if w["focused"] else ""))
+        if st.get("unsaved"):
+            lines.append("- **Has unsaved changes** (title marker)")
+        if st["cwd"]:
+            lines.append(f"- Working directory: `{st['cwd']}`")
+        if st["files"]:
+            lines.append("- Open files: " + ", ".join(f"`{f}`" for f in st["files"][:15]))
+        a = dict(st["app_state"]) if isinstance(st["app_state"], dict) else {}
+        screen = a.pop("screen", None)
+        for d in a.get("documents", []):
+            desc = f"slide/page {d['page'] + 1}/{d.get('pages')}" if d.get("page") is not None else ""
+            if d.get("pen"):
+                desc += f", pen {d['pen']['index'] + 1} selected (color {d['pen']['color']})"
+            if d.get("slideshow"):
+                ss = d["slideshow"]
+                desc += f", SLIDESHOW running at slide {ss['slide'] + 1}" + (f" with {ss['tool']} #{ss['color']}" if ss.get("tool") else "")
+            lines.append(f"- {'**active** ' if d.get('active') else ''}`{d['path']}`: {desc}")
+        if a.get("tabs") and "active_tab" in a:
+            t = a["tabs"][a["active_tab"]]
+            lines.append(f"- Browser: {len(a['tabs'])} tabs, active: {t['title']} <{t['url']}>")
+        if a:
+            lines.append("- App state:")
+            lines += ["  ```json", *["  " + l for l in json.dumps(a, ensure_ascii=False, indent=1).splitlines()[:80]], "  ```"]
+        ui = st.get("ui") or {}
+        for c in ui.get("carets", []):
+            lines.append(f"- Text cursor: line {c['line']}, column {c['column']}" + (" (focused)" if c["focused"] else ""))
+        if ui.get("toggles"):
+            lines.append("- Active tools/toggles: " + ", ".join(f"`{t['name']}`" for t in ui["toggles"][:20] if t["name"]))
+        if ui.get("tabs"):
+            lines.append("- Selected tabs: " + ", ".join(f"`{t['name']}`" for t in ui["tabs"]))
+        if ui.get("texts"):
+            lines.append("- Text fields: " + ", ".join(f"`{t['name'] or '?'}`=`{t['text'][:80]}`" for t in ui["texts"][:10]))
+        if screen:
+            lines += ["- Terminal screen (end):", "  ```", *["  " + l for l in screen.splitlines()[-40:]], "  ```"]
+        if st.get("screenshot"):
+            lines.append(f"- Screenshot: `{STORE / kid / st['screenshot']}`")
+        lines.append("")
+    return "\n".join(lines)

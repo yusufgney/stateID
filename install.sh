@@ -17,16 +17,27 @@ say "Checking dependencies"
 missing=()
 python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null || missing+=(python3-gi)
 python3 -c 'import gi; gi.require_version("Atspi", "2.0")' 2>/dev/null || missing+=(gir1.2-atspi-2.0)
-python3 -c 'import websockets' 2>/dev/null || missing+=(python3-websockets)
+python3 -c 'import gi; gi.require_version("GdkPixbuf", "2.0")' 2>/dev/null || missing+=(gir1.2-gdkpixbuf-2.0)
 if ((${#missing[@]})); then
     echo "Missing packages: ${missing[*]}"
     echo "Install them with: sudo apt install ${missing[*]}"
     exit 1
 fi
 
-say "Installing the stateid command -> $BIN_DIR/stateid"
+say "Creating the Python environment ($REPO/.venv)"
+# --system-site-packages: PyGObject (gi) comes from the distribution, not from PyPI
+if command -v uv >/dev/null; then
+    [[ -x "$REPO/.venv/bin/python" ]] || uv venv -q --system-site-packages --python /usr/bin/python3 "$REPO/.venv"
+    uv pip install -q --python "$REPO/.venv/bin/python" -e "$REPO"
+else
+    [[ -x "$REPO/.venv/bin/python" ]] || /usr/bin/python3 -m venv --system-site-packages "$REPO/.venv"
+    "$REPO/.venv/bin/pip" install -q -e "$REPO"
+fi
+
+say "Installing the commands -> $BIN_DIR/stateid, $BIN_DIR/stateid-mcp"
 mkdir -p "$BIN_DIR"
-ln -sfn "$REPO/bin/stateid" "$BIN_DIR/stateid"
+ln -sfn "$REPO/.venv/bin/stateid" "$BIN_DIR/stateid"
+ln -sfn "$REPO/.venv/bin/stateid-mcp" "$BIN_DIR/stateid-mcp"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "  note: add $BIN_DIR to your PATH" ;; esac
 
 say "Installing the GNOME Shell extension ($UUID)"
@@ -75,7 +86,10 @@ fi
 
 say "Done."
 if ! gdbus introspect --session --dest org.gnome.Shell --object-path /io/github/yusufgney/StateId 2>/dev/null \
-        | grep -q io.github.yusufgney.StateId; then
+        | grep -qF "interface io.github.yusufgney.StateId"; then
     echo "Log out and back in once so GNOME Shell loads the extension."
 fi
 echo "Then try: stateid save --copy   |   stateid --help"
+echo
+echo "To let an AI agent use it (MCP server):"
+echo "  claude mcp add --scope user stateid -- $BIN_DIR/stateid-mcp"
