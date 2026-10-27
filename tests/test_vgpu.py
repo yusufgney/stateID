@@ -199,7 +199,7 @@ def test_keeper_follows_what_each_connection_sets_up(gpu):
     c.close()
     for _ in range(100):
         log = Path(f"{base}/keeper.log").read_text()
-        if "closed" in log:
+        if "could rebuild" in log:  # the whole line (it may be written in parts)
             break
         time.sleep(0.02)
     assert "connection 1 closed" in log and "1 resources; could rebuild: yes" in log
