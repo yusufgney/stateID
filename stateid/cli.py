@@ -1,10 +1,10 @@
 """The `stateid` command."""
 import argparse
+import json
+import os
 import sys
 
-import json
-
-from . import __version__, core, privacy, store
+from . import __version__, core, freeze, privacy, store
 from .shell import ShellUnavailable
 
 DESCRIPTION = """\
@@ -111,6 +111,34 @@ def cmd_config(args):
     print(json.dumps(privacy.load(), indent=2))
 
 
+def cmd_run(args):
+    if not args.command:
+        sys.exit("usage: stateid run [--geometry WxH] PROGRAM [ARGS...]")
+    cfg = privacy.load()
+    if privacy.matches(cfg["privacy"]["exclude"], os.path.basename(args.command[0]), " ".join(args.command)):
+        sys.exit(f"{args.command[0]} is excluded by your privacy settings; it will not be frozen")
+    s = freeze.start(args.command, geometry=args.geometry)
+    freeze.show(s)
+    print(f"session {s['sid']} on display :{s['display']} — saved with its memory by "
+          "`stateid save` / `stateid desktop`")
+
+
+def cmd_sessions(args):
+    if args.stop:
+        freeze.stop(args.stop)
+        print(f"stopped {args.stop}")
+        return
+    data = freeze.sessions()
+    for s in data["sessions"]:
+        shown = "shown" if freeze.viewer_pid(s["sid"]) else "hidden"
+        print(f"{s['sid']}  :{s['display']}  {shown:6}  {' '.join(s['argv'])[:60]}")
+    if not data["sessions"]:
+        print("No freezable sessions running. Start one with `stateid run PROGRAM`.")
+    if data["images"]:
+        total = sum(m["bytes"] for m in data["images"]) / 2**20
+        print(f"\n{len(data['images'])} frozen image(s), {total:.0f} MB")
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="stateid", description=DESCRIPTION, epilog=EPILOG,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -156,6 +184,20 @@ def build_parser():
     s.add_argument("id", nargs="+", help="state IDs")
     s.set_defaults(fn=cmd_delete)
 
+    s = sub.add_parser("run", help="start a program whose memory can be saved (unsaved work included)",
+                       description="Start PROGRAM in a freezable session: it runs on its own virtual display "
+                                   "and is shown in a viewer window. `stateid save` then freezes its whole "
+                                   "memory, so restoring brings back unsaved changes too. Needs the freeze "
+                                   "helper (`install.sh --with-freeze`).")
+    s.add_argument("--geometry", default="1600x900", help="virtual screen size (default 1600x900)")
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the program and its arguments")
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("sessions", help="list freezable sessions",
+                       description="List the sessions started with `stateid run` and the frozen images.")
+    s.add_argument("--stop", metavar="SID", help="stop a session (unsaved work in it is lost)")
+    s.set_defaults(fn=cmd_sessions)
+
     s = sub.add_parser("config", help="show the privacy and storage settings",
                        description="Show the effective settings from ~/.config/stateid/config.toml: windows never "
                                    "captured (exclude), windows hidden from agents (private), private browser tabs, "
@@ -176,7 +218,8 @@ def main():
         return
     try:
         args.fn(args)
-    except (ShellUnavailable, store.StateNotFound, LookupError, privacy.ConfigError) as e:
+    except (ShellUnavailable, store.StateNotFound, LookupError, privacy.ConfigError,
+            freeze.HelperUnavailable, freeze.HelperError) as e:
         sys.exit(str(e))
 
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=stateid freeze helper (CRIU checkpoint/restore of stateid sessions)
+Documentation=https://github.com/yusufgney/stateID
+
+[Service]
+# A root-owned copy; never the user-writable repository.
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/stateid/stateid_helperd.py
+# Sessions are started from this service: stopping or restarting it must not kill them.
+KillMode=process
+Restart=on-failure
+RuntimeDirectory=stateid
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=stateid
+StateDirectoryMode=0700
+UMask=0077
+# No mount-namespace hardening (ProtectHome, PrivateTmp, ...): sessions inherit this
+# service's view of the system, and they need the user's real home and /tmp/.X11-unix.
+
+[Install]
+WantedBy=multi-user.target

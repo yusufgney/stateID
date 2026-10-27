@@ -1,5 +1,7 @@
 # stateid
 
+[![CI](https://github.com/yusufgney/stateID/actions/workflows/ci.yml/badge.svg)](https://github.com/yusufgney/stateID/actions/workflows/ci.yml)
+
 Give the current state of your desktop a short ID, like `DK-7SZKSJV0`, and bring that exact moment back later.
 
 The ID stands for what was open and where you were in it: the slide you were on, the selected red pen, the browser tabs, the folder, the terminal directories and the line your cursor was on. Paste the ID into a terminal to restore it, or give it to an AI agent so it can read what you were doing and carry on.
@@ -52,6 +54,8 @@ stateid show ID             the summary an agent should read (AGENT.md)
 stateid list [-n N]         saved states, newest first
 stateid delete ID...        delete saved states
 stateid config [--init]     show the privacy settings (--init writes a config file)
+stateid run PROGRAM         start a program whose memory (unsaved work) is saved too
+stateid sessions [--stop SID]  list or stop those sessions
 stateid --help              full help; every command also has --help
 ```
 
@@ -99,6 +103,21 @@ On restore, `stateid`:
 - re-applies the saved state, for example going to the page, selecting the pen, starting the slideshow, or moving the cursor.
 
 Other commands that were running in terminals are printed, not re-run.
+
+## Keep unsaved work: freezable sessions
+
+Normally a program's unsaved changes live only in its memory, so restoring reopens the file as it was last saved. For work that must come back exactly, start the program with `stateid run`:
+
+```bash
+stateid run gnome-text-editor      # any X11-capable program
+stateid sessions                   # sessions and frozen images
+```
+
+The program runs on its own virtual display and is shown in a viewer window. When you save (`stateid desktop`, Super+Shift+S, the window menu), its **whole memory is frozen** with [CRIU](https://criu.org) while it keeps running. Restoring the ID brings that exact moment back: unsaved text, undo history, cursor, everything. Freezing takes well under a second; an image is roughly the program's memory size (30–40 MB for a text editor).
+
+This needs a small root helper, installed once with `install.sh --with-freeze` (or `sudo helper/install-helper.sh`). It only freezes sessions it started itself, for the user who asks. Every process of a session must belong to that user. Images are kept where only root can write them, in `/var/lib/stateid/<uid>/`. A session that is still running is never overwritten by a restore.
+
+Limits: the program draws without the GPU, has no sound, and runs without a window manager, so its dialogs appear inside the viewer window. Snap and Flatpak apps are not supported yet. Network connections may drop on restore.
 
 ## Privacy
 
@@ -148,6 +167,8 @@ States are stored in `~/.local/share/stateid/<ID>/` as `state.json`, `AGENT.md` 
 uv pip install --python .venv/bin/python -e ".[dev]"
 .venv/bin/python -m pytest
 ```
+
+CI (GitHub Actions) runs the same tests on every push and pull request, together with an error-only lint, a syntax check of the scripts and the extension, a secret scan (gitleaks) and a dependency audit (pip-audit). Dependabot proposes dependency and action updates every Monday.
 
 The tests in `tests/` cover the privacy layer (redaction, matching, what agents see of a saved state) and need no display. Changes to saving and restoring are tested by hand in a separate headless GNOME Shell session (`dbus-run-session -- gnome-shell --headless --wayland --virtual-monitor 1600x900`), so the desktop you are using is never touched.
 

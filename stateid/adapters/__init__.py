@@ -1,10 +1,11 @@
 from .base import Adapter
 from .chromium import Chromium
+from .frozen import FrozenSession
 from .onlyoffice import OnlyOffice
 from .simple import Evince, Nautilus, VSCode
 from .terminal import Terminal
 
-ADAPTERS = [OnlyOffice(), Chromium(), Terminal(), Nautilus(), Evince(), VSCode()]
+ADAPTERS = [FrozenSession(), OnlyOffice(), Chromium(), Terminal(), Nautilus(), Evince(), VSCode()]
 
 
 def adapter_for(w):

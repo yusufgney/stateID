@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import time
 
 from stateid import core
 from stateid.adapters.base import Adapter
@@ -11,6 +12,10 @@ from stateid.procs import launch_argv
 def test_appimage_is_saved_as_the_appimage_file(tmp_path):
     env = dict(os.environ, APPIMAGE="/opt/pt/packettracer.AppImage", OWD=str(tmp_path))
     p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], env=env)
+    for _ in range(100):  # until the child has exec'd and carries its own environment
+        if b"APPIMAGE=" in open(f"/proc/{p.pid}/environ", "rb").read():
+            break
+        time.sleep(0.01)
     try:
         cmd, cwd = launch_argv(p.pid, ["./PacketTracer", "lab.pkt"], "/tmp/.mount_packetXYZ/opt/pt/bin")
     finally:

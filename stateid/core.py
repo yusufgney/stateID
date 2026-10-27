@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime
 
-from . import __version__, a11y, privacy, store
+from . import __version__, a11y, freeze, privacy, store
 from .adapters import adapter_for
 from .adapters.terminal import resume_argv
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, launch_argv, read_proc,
@@ -148,6 +148,20 @@ def _apply_privacy(st, cfg):
             a["screen"] = privacy.redact(a["screen"])
 
 
+def freeze_sessions(states):
+    """Freeze the memory of every `stateid run` session among the saved windows. Runs after the
+    screenshots, because the viewer window is closed and reopened around the freeze."""
+    for st in states:
+        a = st.get("app_state")
+        if not (isinstance(a, dict) and a.get("freeze_session")):
+            continue
+        try:
+            meta = freeze.freeze(a["freeze_session"])
+            a["frozen_image"], a["frozen_bytes"] = meta["iid"], meta["bytes"]
+        except (freeze.HelperUnavailable, freeze.HelperError) as e:
+            a["freeze_error"] = str(e)
+
+
 def save(window=None, focused=False, copy=False, screenshots=True):
     """Snapshot windows (all, one by sequence number, or the focused one). Returns the new state's summary,
     already filtered for agents."""
@@ -182,6 +196,7 @@ def save(window=None, focused=False, copy=False, screenshots=True):
             if screenshots and p["screenshots"] and shell.capture(w["seq"], d / png):
                 st["screenshot"] = png
             states.append(st)
+        freeze_sessions(states)
         created = datetime.now().isoformat(timespec="seconds")
         scope = "window" if window is not None or focused else "desktop"
         excluded_apps = [w["app_name"] or w["wm_class"] for w in excluded]

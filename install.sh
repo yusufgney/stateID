@@ -11,6 +11,16 @@ APP_DIR="$HOME/.local/share/applications"
 KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/stateid/"
 ONLYOFFICE_PORT="${STATEID_ONLYOFFICE_PORT:-9333}"
 
+WITH_FREEZE=0
+for arg in "$@"; do
+    case $arg in
+        --with-freeze) WITH_FREEZE=1 ;;
+        -h|--help) echo "usage: install.sh [--with-freeze]   (--with-freeze: also install the root helper"
+                   echo "       that saves programs started with \`stateid run\` together with their memory)"; exit 0 ;;
+        *) echo "unknown option $arg"; exit 1 ;;
+    esac
+done
+
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 
 say "Checking dependencies"
@@ -85,6 +95,11 @@ if [[ -n "$oo" ]]; then
     echo "  $APP_DIR/$(basename "$oo") (restart OnlyOffice from the app menu once)"
 else
     echo "  OnlyOffice not found, skipped"
+fi
+
+if ((WITH_FREEZE)); then
+    say "Installing the freeze helper (asks for your password)"
+    sudo "$REPO/helper/install-helper.sh"
 fi
 
 say "Done."

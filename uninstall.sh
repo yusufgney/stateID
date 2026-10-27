@@ -26,3 +26,6 @@ for f in "$HOME"/.local/share/applications/*onlyoffice*desktopeditors*.desktop; 
     [[ -f "$f" ]] && grep -q -- "--remote-debugging-port" "$f" && rm -f "$f"
 done
 echo "stateid removed. Saved states are still in ~/.local/share/stateid"
+if [[ -f /etc/systemd/system/stateid-helper.service ]]; then
+    echo "The freeze helper is still installed; remove it with: sudo $(dirname "$0")/helper/install-helper.sh --uninstall"
+fi

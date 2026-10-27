@@ -67,7 +67,15 @@ def list_states(limit=20):
 
 
 def delete(kid):
-    load(kid)
+    data = load(kid)
+    from . import freeze  # frozen sessions saved in this state go with it
+    for st in data["windows"]:
+        iid = (st.get("app_state") or {}).get("frozen_image") if isinstance(st.get("app_state"), dict) else None
+        if iid and freeze.available():
+            try:
+                freeze.call("delete", iid=iid)
+            except (freeze.HelperUnavailable, freeze.HelperError):
+                pass
     shutil.rmtree(path(kid))
     return normalize(kid)
 
