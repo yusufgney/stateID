@@ -43,6 +43,7 @@ RUN_BASE = Path("/run/stateid")
 CRIU = "/usr/sbin/criu"
 XVNC = next((p for p in ("/usr/bin/Xtigervnc", "/usr/bin/Xvnc") if os.path.exists(p)), "/usr/bin/Xvnc")
 DBUS_RUN_SESSION = "/usr/bin/dbus-run-session"
+WM = "/usr/bin/matchbox-window-manager"  # optional: fills the viewer, keeps dialogs on top
 PYTHON = "/usr/bin/python3"
 
 MIN_UID = 1000              # system accounts and root cannot use the helper
@@ -146,7 +147,31 @@ def check_owned(pids, uid, status=proc_status):
         if any(int(g) != gid for g in st.get("Gid", "").split()):
             raise Refused(f"process {p} of the session runs with another group")
         if int(st.get("CapEff", "0"), 16) or int(st.get("CapPrm", "0"), 16):
-            raise Refused(f"process {p} of the session holds capabilities")
+            name = (st.get("Name") or "?").strip()
+            raise Refused(f"process {p} ({name}) of the session holds capabilities, so it cannot be "
+                          "frozen; stop that part of the program and try again")
+
+
+def check_sandboxes(pids, status=proc_status):
+    """CRIU cannot freeze a process in a nested PID namespace. Programs start those briefly, e.g.
+    GTK's image loader (glycin) runs in bwrap and lingers about 30 s after a file dialog."""
+    for p in pids:
+        st = status(p)
+        if st and len(st.get("NSpid", "").split()) > 1:
+            name = (st.get("Name") or "?").strip()
+            raise Refused(f"process {p} ({name}) runs in its own sandbox, which cannot be frozen "
+                          "(often an image loader after a file dialog); wait about 30 seconds and try again")
+
+
+def killable(pids, uid, status=proc_status):
+    """The processes the user could kill themselves: every user id is theirs (capabilities are
+    fine, unlike for freezing). Others are left alone."""
+    out = []
+    for p in pids:
+        st = status(p)
+        if st is not None and all(int(u) == uid for u in st.get("Uid", "").split()):
+            out.append(p)
+    return out
 
 
 # ---------------------------------------------------------------- request validation
@@ -335,6 +360,7 @@ class Helper:
         s = self.session(uid, req.get("sid"))
         pids = tree(s["pid"])
         check_owned(pids, uid)
+        check_sandboxes(pids)
         imgs = self.images(uid)
         if len(imgs) >= MAX_IMAGES:
             raise Refused(f"you have {MAX_IMAGES} frozen images; delete some first")
@@ -400,9 +426,7 @@ class Helper:
 
     def stop(self, uid, req):
         s = self.session(uid, req.get("sid"))
-        pids = tree(s["pid"])
-        check_owned(pids, uid)
-        for p in reversed(pids):
+        for p in reversed(killable(tree(s["pid"]), uid)):
             try:
                 os.kill(p, signal.SIGKILL)
             except ProcessLookupError:
@@ -495,28 +519,35 @@ def session_init(spec):
         [XVNC, f":{display}", "-geometry", spec["geometry"], "-depth", "24", "-rfbport", "-1",
          "-rfbunixpath", f"{rdir}/vnc.sock", "-rfbunixmode", "0600", "-SecurityTypes", "None",
          "-AlwaysShared", "-AcceptSetDesktopSize", "-nolisten", "tcp", "-extension", "MIT-SHM",
-         # no GPU: an open /dev/dri render node cannot be checkpointed
-         "-rendernode", "none",
+         # no GPU: an open /dev/dri render node cannot be checkpointed, and without GLX no program
+         # creates a Mesa context (which opens /dev/udmabuf)
+         "-rendernode", "none", "-extension", "GLX",
          "-desktop", f"{os.path.basename(spec['argv'][0])} (stateid {os.path.basename(rdir)})"],
         stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"]})
     for _ in range(200):
         if os.path.exists(f"/tmp/.X11-unix/X{display}"):
             break
         time.sleep(0.05)
+    wm = None
+    if os.path.exists(WM):  # part of the session, so it is frozen and restored with the program
+        wm = subprocess.Popen([WM, "-use_titlebar", "no", "-display", f":{display}"],
+                              stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"]})
     cwd = spec["cwd"] if os.path.isdir(spec["cwd"]) else spec["env"]["HOME"]
     app = subprocess.Popen([DBUS_RUN_SESSION, f"--config-file={rdir}/dbus.conf", "--", *spec["argv"]],
                            cwd=cwd, env=spec["env"], stdin=subprocess.DEVNULL)
 
+    procs = [p for p in (app, wm, xvnc) if p]
+
     def finish(*_):
-        for p in (app, xvnc):  # a clean stop lets Xvnc remove its socket and lock files
+        for p in procs:  # a clean stop lets Xvnc remove its socket and lock files
             try:
                 p.terminate()
             except OSError:
                 pass
         deadline = time.time() + 2
-        while time.time() < deadline and (app.poll() is None or xvnc.poll() is None):
+        while time.time() < deadline and any(p.poll() is None for p in procs):
             time.sleep(0.05)
-        for p in (app, xvnc):
+        for p in procs:
             if p.poll() is None:
                 p.kill()
         os._exit(0)

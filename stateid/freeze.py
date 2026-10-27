@@ -96,12 +96,26 @@ def viewer_pid(sid):
     return pid if sid.encode() in cmd else None
 
 
+def _running(pid):
+    """False once the process has exited; a viewer started by this process is reaped here,
+    otherwise it would stay a zombie and look alive."""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:
+        pass  # not our child
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
 def hide(sid):
     pid = viewer_pid(sid)
     if pid:
         os.kill(pid, signal.SIGTERM)
         for _ in range(40):
-            if not Path(f"/proc/{pid}").exists():
+            if not _running(pid):
                 break
             time.sleep(0.05)
     (VIEWER_DIR / sid).unlink(missing_ok=True)

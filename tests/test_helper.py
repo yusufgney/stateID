@@ -119,6 +119,21 @@ def test_foreign_or_privileged_processes_are_refused():
         hd.check_owned([1], UID, status=lambda p: other_group)
 
 
+def test_stop_kills_capable_processes_of_the_user_but_never_foreign_ones():
+    me = hd.proc_status(os.getpid())
+    table = {1: me, 2: dict(me, CapEff="0000000000003000"), 3: dict(me, Uid=f"{UID}\t0\t{UID}\t{UID}"),
+             4: dict(me, Uid="0\t0\t0\t0"), 5: None}
+    assert hd.killable([1, 2, 3, 4, 5], UID, status=table.get) == [1, 2]
+
+
+def test_processes_in_a_nested_pid_namespace_are_refused_with_a_reason(sleeper):
+    hd.check_sandboxes(hd.tree(sleeper.pid))
+    me = hd.proc_status(os.getpid())
+    sandboxed = dict(me, Name="bwrap", NSpid=f"{os.getpid()}\t1")
+    with pytest.raises(hd.Refused, match="sandbox"):
+        hd.check_sandboxes([1], status=lambda p: sandboxed)
+
+
 def test_init_process_of_the_system_is_refused():
     with pytest.raises(hd.Refused):
         hd.check_owned([1], UID)

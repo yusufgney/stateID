@@ -18,8 +18,8 @@ if [[ ${1:-} == --uninstall ]]; then
     exit 0
 fi
 
-echo "Installing criu, the virtual display (Xvnc) and the viewer"
-apt-get install -y criu tigervnc-standalone-server tigervnc-viewer
+echo "Installing criu, the virtual display (Xvnc), its window manager and the viewer"
+apt-get install -y criu tigervnc-standalone-server tigervnc-viewer matchbox-window-manager
 
 echo "Installing the helper -> $DEST"
 install -d -o root -g root -m 0755 "$DEST"
