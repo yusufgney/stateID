@@ -2,12 +2,13 @@
 while the proxy is detached for a freeze, and a second copy of a session cannot take over."""
 import os
 import socket
+import struct
 import threading
 import time
 
 import pytest
 
-from stateid import vgpu
+from stateid import vgpu, vgpu_state
 
 
 def fake_server(path):
@@ -18,7 +19,10 @@ def fake_server(path):
 
     def serve(c):
         while data := c.recv(4096):
-            if data == b"F":
+            if data[4:8] == struct.pack("<I", vgpu_state.RES_CREATE2):  # answer like vtest: id, then the fd
+                c.sendall(struct.pack("<III", 1, vgpu_state.RES_CREATE2, 1))
+                vgpu.send_chunk(c, b"\0", [os.memfd_create("res")])
+            elif data == b"F":
                 fd = os.memfd_create("res")
                 os.write(fd, b"shared")
                 c.sendall(b"reply")
@@ -50,7 +54,7 @@ def gpu(tmp_path):
         if os.path.exists(f"{base}/gpu.ctl"):
             break
         time.sleep(0.01)
-    yield base, proxy
+    yield base, proxy, keeper
     for f in os.listdir(base):
         os.unlink(f"{base}/{f}")
     os.rmdir(base)
@@ -83,7 +87,7 @@ def test_fd_stays_on_its_own_byte(gpu):
 
 
 def test_nothing_is_lost_while_detached(gpu):
-    base, proxy = gpu
+    base, proxy, _ = gpu
     c = client(base)
     c.sendall(b"before")
     assert c.recv(100) == b"before"
@@ -96,7 +100,7 @@ def test_nothing_is_lost_while_detached(gpu):
 
 
 def test_a_second_copy_is_refused(gpu):
-    base, _ = gpu
+    base, _, _ = gpu
     other = vgpu.Proxy(f"{base}/o.vtest", f"{base}/o.ctl", f"{base}/keeper")
     with pytest.raises(RuntimeError, match="refused"):
         other.connect()
@@ -121,3 +125,23 @@ def test_server_gets_the_staticbuf_library(tmp_path, monkeypatch):
     lib = env["LD_PRELOAD"]
     assert lib.startswith(str(tmp_path)) and os.path.exists(lib)
     assert vgpu.server_env("intel")["LD_PRELOAD"] == lib  # built once
+
+
+def test_keeper_follows_what_each_connection_sets_up(gpu):
+    _, _, keeper = gpu
+    c = client(gpu[0])
+    c.sendall(struct.pack("<13I", 11, vgpu_state.RES_CREATE2, 0, 2, 1, 0, 64, 64, 1, 1, 0, 0, 4096))
+    got = b""
+    while len(got) < 12:
+        got += c.recv(12 - len(got))
+    _, fds = vgpu.recv_chunk(c)
+    assert len(fds) == 1
+    os.close(fds[0])
+    state, = keeper.states.values()
+    assert list(state.resources) == [1] and state.resources[1][1] == 0 and state.problem is None
+    c.close()
+    for _ in range(100):
+        if not keeper.states:
+            break
+        time.sleep(0.01)
+    assert not keeper.states  # forgotten with the connection

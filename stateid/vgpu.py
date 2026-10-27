@@ -31,6 +31,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import vgpu_state
+
 HEADER = struct.Struct("<BIIB")  # type, connection, payload length, number of fds
 DATA, OPEN, CLOSE, DETACH, DETACH_ACK, ATTACH, ATTACHED, REFUSED = range(1, 9)
 FD_SPACE = socket.CMSG_SPACE(32 * 4)
@@ -112,6 +114,7 @@ class Keeper:
     def __init__(self, path, server_sock):
         self.path, self.server_sock = path, server_sock
         self.upstreams = {}       # connection -> socket to the server
+        self.states = {}          # connection -> vgpu_state.Connection: what it has set up on the server
         self.link = None
         self.pending = []         # frames for the proxy while it is detached
         self.lock = threading.Lock()
@@ -138,6 +141,8 @@ class Keeper:
             if not data and not fds:
                 self.to_proxy(CLOSE, conn)
                 return
+            if fds and conn in self.states:
+                self.states[conn].from_server_fds(len(fds))
             self.to_proxy(DATA, conn, data, fds)
 
     def serve_link(self, link):
@@ -147,11 +152,17 @@ class Keeper:
                 s = socket.socket(socket.AF_UNIX)
                 s.connect(self.server_sock)
                 self.upstreams[conn] = s
+                self.states[conn] = vgpu_state.Connection()
                 threading.Thread(target=self.pump, args=(conn, s), daemon=True).start()
             elif kind == DATA and conn in self.upstreams:
+                self.states[conn].from_client(data)  # before the server can answer it
                 relay_chunk(self.upstreams[conn], data, fds)
             elif kind == CLOSE and conn in self.upstreams:
                 self.upstreams.pop(conn).shutdown(socket.SHUT_WR)
+                state = self.states.pop(conn, None)
+                print(f"stateid: connection {conn} closed; kept {state.size()} bytes of state, "
+                      f"{len(state.resources)} resources; could rebuild: {state.problem or 'yes'}",
+                      file=sys.stderr, flush=True)
             elif kind == DETACH:
                 with self.lock:  # nothing more goes to the proxy until it attaches again
                     self.link = None
