@@ -148,7 +148,14 @@ def cmd_run(args):
     cfg = privacy.load()
     if privacy.matches(cfg["privacy"]["exclude"], os.path.basename(args.command[0]), " ".join(args.command)):
         sys.exit(f"{args.command[0]} is excluded by your privacy settings; it will not be frozen")
-    s = freeze.start(args.command, geometry=args.geometry)
+    argv = args.command
+    if args.gpu:
+        from . import vgpu
+        try:
+            argv = vgpu.wrap(argv, None if args.gpu == "auto" else args.gpu)
+        except vgpu.GpuError as e:
+            sys.exit(str(e))
+    s = freeze.start(argv, geometry=args.geometry)
     freeze.show(s)
     print(f"session {s['sid']} on display :{s['display']} — saved with its memory by "
           "`stateid save` / `stateid desktop`")
@@ -248,6 +255,9 @@ def build_parser():
                                    "memory, so restoring brings back unsaved changes too. Needs the freeze "
                                    "helper (`install.sh --with-freeze`).")
     s.add_argument("--geometry", default="1600x900", help="virtual screen size (default 1600x900)")
+    s.add_argument("--gpu", nargs="?", const="auto", choices=["auto", "intel", "nvidia"],
+                   help="experimental: render on the GPU (OpenGL through virgl); the session can be frozen "
+                        "but not yet restored")
     s.add_argument("command", nargs=argparse.REMAINDER, help="the program and its arguments")
     s.set_defaults(fn=cmd_run)
 

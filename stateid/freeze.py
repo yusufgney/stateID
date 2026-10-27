@@ -123,10 +123,20 @@ def hide(sid):
 
 
 def freeze(sid):
-    """Checkpoint a running session (it keeps running). The viewer reconnects afterwards."""
+    """Checkpoint a running session (it keeps running). The viewer reconnects afterwards, and so
+    does the GPU proxy of a session started with --gpu (its link leaves the session)."""
+    from . import vgpu
+    session = next((s for s in sessions()["sessions"] if s["sid"] == sid), None)
     shown = hide(sid)
     try:
-        return call("freeze", sid=sid, leave_running=True)
+        gpu = bool(session) and vgpu.control(session["run_dir"], "detach")
+        try:
+            return call("freeze", sid=sid, leave_running=True)
+        finally:
+            if gpu:
+                vgpu.control(session["run_dir"], "attach")
+    except vgpu.GpuError as e:
+        raise HelperError(str(e)) from e
     finally:
         if shown:
             s = next((s for s in sessions()["sessions"] if s["sid"] == sid), None)
@@ -140,6 +150,10 @@ def restore(iid):
     imgs = {m["iid"]: m for m in sessions()["images"]}
     if iid not in imgs:
         raise HelperError(f"no frozen image {iid}")
+    from . import vgpu
+    if vgpu.is_wrapped(imgs[iid]["argv"]):
+        raise HelperError("restoring a session started with --gpu is not supported yet: its GPU state "
+                          "is not saved with the image")
     for s in sessions()["sessions"]:
         if s["display"] == imgs[iid]["display"]:
             hide(s["sid"])
