@@ -167,10 +167,15 @@ pub const CLOSE: u8 = 3;
 pub const DETACH: u8 = 4;
 pub const DETACH_ACK: u8 = 5;
 pub const ATTACH: u8 = 6;
-pub const ATTACHED: u8 = 7;
+pub const ATTACHED: u8 = 7;  // with the connections the keeper holds, as u32s
 pub const REFUSED: u8 = 8;
 pub const MOVE: u8 = 9;    // rebuild every connection on a new server connection (a test of rebuilding)
 pub const MOVED: u8 = 10;
+pub const STATE: u8 = 11;    // keeper -> proxy on DETACH: a connection's saved state (kept in the frozen session)
+pub const FORGET: u8 = 12;   // keeper -> proxy: the resource with this fd index (u32) is freed
+pub const FDS: u8 = 13;      // proxy -> keeper: shared memory to restore with, its fd indexes as u32s
+pub const RESTORE: u8 = 14;  // proxy -> keeper: rebuild this connection from its saved state
+pub const RESTORED: u8 = 15; // keeper -> proxy: done (a CLOSE came first if it failed)
 const HEADER: usize = 10; // kind u8, connection u32, payload length u32, number of fds u8
 
 pub struct Frame {

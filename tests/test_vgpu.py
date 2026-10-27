@@ -19,6 +19,7 @@ import pytest
 from stateid import vgpu
 
 RES_CREATE2 = 12
+FD_PLEASE = 70  # a made-up vtest command the fake server answers with an fd
 pytestmark = pytest.mark.skipif(not shutil.which("cargo"), reason="needs cargo to build stateid-vgpu")
 
 
@@ -37,9 +38,14 @@ def send_fd(sock, fd):
     os.close(fd)
 
 
+def vt(cmd, *dwords):
+    return struct.pack(f"<II{len(dwords)}I", len(dwords), cmd, *dwords)
+
+
 def fake_server(path):
-    """Echoes what it reads; on b"F" it answers like vtest sends an fd: a reply, then one byte with
-    the fd; a RESOURCE_CREATE2 gets resource 1 and a shared-memory fd."""
+    """Echoes the commands it reads (the keeper passes on whole vtest commands only); FD_PLEASE is
+    answered like vtest sends an fd: a reply, then one byte with the fd; a RESOURCE_CREATE2 gets
+    resource 1 and a shared-memory fd."""
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(path)
     srv.listen()
@@ -49,10 +55,10 @@ def fake_server(path):
             if data[4:8] == struct.pack("<I", RES_CREATE2):
                 c.sendall(struct.pack("<III", 1, RES_CREATE2, 1))
                 send_fd(c, os.memfd_create("res"))
-            elif data == b"F":
+            elif data == vt(FD_PLEASE):
                 fd = os.memfd_create("res")
                 os.write(fd, b"shared")
-                c.sendall(b"reply")
+                c.sendall(vt(FD_PLEASE, 7))
                 send_fd(c, fd)
             else:
                 c.sendall(data)
@@ -136,14 +142,15 @@ def recv_exactly(c, n):
 
 def test_bytes_pass_both_ways(gpu):
     c = client(gpu[0])
-    c.sendall(b"hello")
-    assert c.recv(100) == b"hello"
+    c.sendall(vt(99, 1, 2)[:9])  # half a command waits for the rest
+    c.sendall(vt(99, 1, 2)[9:])
+    assert recv_exactly(c, 16) == vt(99, 1, 2)
 
 
 def test_fd_stays_on_its_own_byte(gpu):
     c = client(gpu[0])
-    c.sendall(b"F")
-    assert recv_exactly(c, 5) == b"reply"
+    c.sendall(vt(FD_PLEASE))
+    assert recv_exactly(c, 12) == vt(FD_PLEASE, 7)
     data, fds = recv_chunk(c)
     assert data == b"\0" and len(fds) == 1
     assert os.pread(fds[0], 6, 0) == b"shared"
@@ -153,16 +160,16 @@ def test_fd_stays_on_its_own_byte(gpu):
 def test_nothing_is_lost_while_detached(gpu):
     base = gpu[0]
     c = client(base)
-    c.sendall(b"before")
-    assert c.recv(100) == b"before"
+    c.sendall(vt(99, 1))
+    assert recv_exactly(c, 12) == vt(99, 1)
     assert vgpu.control(f"{base}/run", "detach")
-    c.sendall(b"during")  # waits in the proxy
+    c.sendall(vt(99, 2))  # waits in the proxy
     c.settimeout(0.3)
     with pytest.raises(TimeoutError):
         c.recv(100)
     c.settimeout(5)
     assert vgpu.control(f"{base}/run", "attach")
-    assert c.recv(100) == b"during"
+    assert recv_exactly(c, 12) == vt(99, 2)
 
 
 def test_detached_proxy_keeps_no_link_open(gpu):
@@ -221,10 +228,6 @@ def test_keeper_ends_with_its_session_and_stops_the_server(exe):
         shutil.rmtree(base)
 
 
-def vt(cmd, *dwords):
-    return struct.pack(f"<II{len(dwords)}I", len(dwords), cmd, *dwords)
-
-
 @pytest.mark.skipif(not shutil.which("virgl_test_server"), reason="needs virgl_test_server")
 def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory_and_contents(exe, request, monkeypatch):
     """Moving to a new server keeps a buffer filled through shared memory (the new server reads the
@@ -273,6 +276,76 @@ def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory_and_contents(
     finally:
         end(proxy)
         for _ in range(100):  # the keeper ends with the session and stops its server
+            if not os.path.exists(keeper_sock):
+                break
+            time.sleep(0.05)
+        shutil.rmtree(base)
+
+
+def own_keeper(keeper_sock):
+    for p in os.listdir("/proc"):
+        try:
+            argv = Path(f"/proc/{p}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) > 2 and argv[1] == b"keeper" and argv[2] == keeper_sock.encode():
+            return int(p)
+    return None
+
+
+@pytest.mark.skipif(not shutil.which("virgl_test_server"), reason="needs virgl_test_server")
+def test_a_new_keeper_rebuilds_what_the_proxy_kept_from_a_detach(exe, request, monkeypatch):
+    """As after restoring a frozen session: the keeper and server that held the GPU state are gone, a
+    new keeper is started, and the proxy hands it the state saved at the detach (with the shared
+    memory it kept): the program's buffer and texture are there again."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(request.config.cache.mkdir("stateid-vgpu")))
+    base = f"/tmp/sgt-{os.getpid()}-{time.monotonic_ns()}"
+    os.mkdir(base)
+    keeper_sock = vgpu.start_keeper(base, "k")
+    proxy = subprocess.Popen([exe, "proxy", keeper_sock, "--", "sleep", "600"], start_new_session=True,
+                             env=dict(os.environ, XDG_RUNTIME_DIR=base))
+    try:
+        wait_for(f"{base}/gpu.ctl", proxy)
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(f"{base}/gpu.vtest")
+        c.settimeout(10)
+        c.sendall(struct.pack("<II", 4, 8) + b"test" + vt(11, 3))
+        recv_exactly(c, 12)
+        shms = {}
+        for args in ((0, 64, 0x10, 64, 1, 1, 1, 0, 0), (2, 67, 0xa, 4, 4, 1, 1, 0, 0)):  # buffer, 4x4 texture
+            c.sendall(vt(RES_CREATE2, 0, *args, 64))
+            res = struct.unpack("<III", recv_exactly(c, 12))[2]
+            _, fds = recv_chunk(c)
+            shms[res] = (mmap.mmap(fds[0], 64), args[3], args[4])
+            os.close(fds[0])
+
+        def transfer(cmd, res):
+            _, w, h = shms[res]
+            c.sendall(vt(cmd, res, 0, 0, 0, 0, w, h, 1, 0, 0) + vt(7, res, 1))
+            recv_exactly(c, 12)
+        (buf, (b_shm, _, _)), (tex, (t_shm, _, _)) = shms.items()
+        b_shm[:5] = b"hello"
+        transfer(14, buf)
+        t_shm[:] = bytes(range(64))
+        transfer(14, tex)
+        t_shm[:] = bytes(64)  # only the GPU has it now
+        assert vgpu.control(base, "detach")
+        os.kill(own_keeper(keeper_sock), signal.SIGTERM)  # it stops its server too
+        for _ in range(100):
+            if not os.path.exists(keeper_sock):
+                break
+            time.sleep(0.05)
+        assert vgpu.start_keeper(base, "k") == keeper_sock
+        assert vgpu.control(base, "attach")
+        b_shm[:5] = bytes(5)
+        transfer(13, buf)
+        transfer(13, tex)
+        assert b_shm[:5] == b"hello" and t_shm[:] == bytes(range(64))
+        log = Path(f"{base}/k.log").read_text()
+        assert "1 connections saved" in log and "connection 1 restored" in log
+    finally:
+        end(proxy)
+        for _ in range(100):
             if not os.path.exists(keeper_sock):
                 break
             time.sleep(0.05)

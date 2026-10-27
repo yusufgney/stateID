@@ -11,8 +11,9 @@ The server gets a small preloaded library (vgpu_preload.c, built with the system
 first use) that keeps its buffers in GPU memory on NVIDIA and lets the keeper hand it shared memory when it
 rebuilds a program's state; without a compiler it runs, only slower.
 
-Not done yet: restoring a frozen image later brings the program back without its GPU state (the
-keeper's state belongs to the session that kept running), so its rendering breaks.
+On detach the keeper hands the proxy each connection's state, with what the GPU held, so the frozen
+image carries it. Restoring an image starts a new keeper where the proxy looks for one; the restored
+proxy gives it that state and the shared memory it kept, and the keeper rebuilds it on a new server.
 """
 import hashlib
 import os
@@ -99,7 +100,7 @@ def start_keeper(sock_dir, name, gpu=None):
 
 def wrap(argv, gpu=None):
     """The command line that runs `argv` in a freezable session with GPU rendering."""
-    name = f"{os.getpid()}-{int(time.time() * 1000)}"
+    name = f"{os.getpid()}-{int(time.time() * 1000)}-{gpu or 'auto'}"  # the GPU, for a restore
     sock_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "stateid-gpu"
     keeper = start_keeper(sock_dir, name, gpu)
     return [str(binary()), "proxy", keeper, "--", *argv]
@@ -108,6 +109,30 @@ def wrap(argv, gpu=None):
 def is_wrapped(argv):
     return (len(argv) > 3 and argv[1:3] == ["-m", "stateid.vgpu"]  # the Python proxy, before stateid-vgpu
             or len(argv) > 3 and Path(argv[0]).name.startswith("stateid-vgpu") and argv[1] == "proxy")
+
+
+def restart_keeper(argv):
+    """Before restoring a session started with --gpu: start a keeper where its proxy looks for one.
+    The session's own keeper ended with it (it is waited for); the restored proxy hands the new one
+    the GPU state saved in the image, which rebuilds it on a new server."""
+    if not (is_wrapped(argv) and Path(argv[0]).name.startswith("stateid-vgpu")):
+        raise GpuError("this image was frozen before GPU state was saved with it")
+    keeper = Path(argv[2])
+    for _ in range(100):
+        if not keeper.exists():
+            break
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(keeper))
+        except OSError:
+            keeper.unlink(missing_ok=True)  # left behind
+            break
+        time.sleep(0.05)
+    else:
+        raise GpuError(f"the GPU keeper {keeper} is still serving a session")
+    name = keeper.name.removesuffix(".keeper")
+    gpu = name.rsplit("-", 1)[-1]
+    start_keeper(keeper.parent, name, gpu if gpu in ("intel", "nvidia") else None)
 
 
 def preload_lib():

@@ -33,6 +33,7 @@ pub struct Keeper {
     moving: Mutex<HashSet<u32>>,                          // their old server connection is closing
     pausing: Mutex<HashSet<u32>>,                         // their pump stops at the answer to our ping
     shm_offer: Mutex<HashMap<u32, OwnedFd>>,              // resource id -> shared memory, while rebuilding
+    restoring: Mutex<HashMap<u32, HashMap<u32, OwnedFd>>>,  // connection -> fd index -> shared memory
 }
 
 fn dw(b: &[u8], i: usize) -> u32 {
@@ -71,6 +72,7 @@ impl Keeper {
             moving: Mutex::new(HashSet::new()),
             pausing: Mutex::new(HashSet::new()),
             shm_offer: Mutex::new(HashMap::new()),
+            restoring: Mutex::new(HashMap::new()),
         })
     }
 
@@ -355,6 +357,81 @@ impl Keeper {
         }
     }
 
+    /// Before a freeze: give the proxy each connection's state with what the GPU holds, so that the
+    /// frozen session carries it (a keeper started later rebuilds from it).
+    fn save_all(self: &Arc<Self>, writer: &LinkWriter) {
+        let started = Instant::now();
+        let mut conns: Vec<u32> = self.upstreams.lock().unwrap().keys().copied().collect();
+        conns.sort_unstable();
+        let (mut saved, mut bytes) = (0, 0);
+        for conn in conns {
+            let Some(st) = self.state(conn) else { continue };
+            if let Some(p) = &st.lock().unwrap().problem {
+                eprintln!("stateid-vgpu: connection {conn} is not saved: {p}");
+                continue;
+            }
+            let sock = match self.pause(conn) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stateid-vgpu: connection {conn} is not saved: {e}");
+                    continue;
+                }
+            };
+            let mut st_ = st.lock().unwrap();
+            let blob = match Self::read_contents(&mut st_, &sock) {
+                Ok((_, _, skipped)) => {
+                    if !skipped.is_empty() {
+                        eprintln!("stateid-vgpu: connection {conn}: contents not saved of {}", skipped.join(", "));
+                    }
+                    Some(st_.save())
+                }
+                Err(e) => {
+                    eprintln!("stateid-vgpu: connection {conn} is not saved: {e}");
+                    None
+                }
+            };
+            st_.contents.clear();
+            drop(st_);
+            if let Some(blob) = blob {
+                bytes += blob.len();
+                saved += 1;
+                let _ = writer.send(wire::STATE, conn, &blob, &[]);
+            }
+            if let Err(e) = self.start_pump(conn, sock) {  // it goes on as before
+                eprintln!("stateid-vgpu: connection {conn}: {e}");
+            }
+        }
+        eprintln!("stateid-vgpu: {saved} connections saved for the freeze ({:.1} MB) in {:.0?}",
+                  bytes as f64 / 1e6, started.elapsed());
+    }
+
+    /// A restored session's proxy hands back a connection this keeper never had: rebuild it on the
+    /// server from its saved state and the shared memory the proxy kept.
+    fn restore(self: &Arc<Self>, conn: u32, saved: &[u8]) {
+        let started = Instant::now();
+        let mut kept = self.restoring.lock().unwrap().remove(&conn).unwrap_or_default();
+        let result = Connection::load(saved).map_err(io::Error::other).and_then(|mut st| {
+            for id in st.resources.ids() {
+                if let Some(fd) = st.resources.fd_index(id).and_then(|i| kept.remove(&i)) {
+                    st.shm.insert(id, fd);
+                }
+            }
+            let s = self.rebuild(&mut st)?;
+            let summary = format!("{} resources, {} bytes of state", st.resources.len(), st.size());
+            self.states.lock().unwrap().insert(conn, Arc::new(Mutex::new(st)));
+            self.start_pump(conn, s)?;
+            Ok(summary)
+        });
+        match result {
+            Ok(summary) => eprintln!("stateid-vgpu: connection {conn} restored in {:.0?}: {summary}", started.elapsed()),
+            Err(e) => {
+                eprintln!("stateid-vgpu: connection {conn} could not be restored: {e}");
+                self.states.lock().unwrap().remove(&conn);
+                self.to_proxy(Frame::new(wire::CLOSE, conn));
+            }
+        }
+    }
+
     /// Answer the server's preloaded library: a resource id -> its shared memory, while rebuilding.
     fn serve_shm(self: Arc<Self>, listener: UnixListener) {
         for c in listener.incoming() {
@@ -383,10 +460,23 @@ impl Keeper {
                 wire::DATA => {
                     let up = self.upstreams.lock().unwrap().get(&f.conn).cloned();
                     if let Some(up) = up {
-                        if let Some(st) = self.state(f.conn) {
-                            st.lock().unwrap().from_client(&f.data);  // before the server can answer it
+                        let (data, forgotten) = match self.state(f.conn) {
+                            Some(st) => {
+                                let mut st = st.lock().unwrap();  // followed before the server can answer
+                                (st.from_client(&f.data), std::mem::take(&mut st.forgotten))
+                            }
+                            None => (f.data, Vec::new()),
+                        };
+                        for index in forgotten {
+                            self.to_proxy(Frame { kind: wire::FORGET, conn: f.conn, data: index.to_le_bytes().to_vec(),
+                                                  fds: Vec::new() });
                         }
-                        let _ = wire::relay(up.as_raw_fd(), &f.data, &f.fds);
+                        if !data.is_empty() || !f.fds.is_empty() {
+                            let _ = wire::relay(up.as_raw_fd(), &data, &f.fds);
+                        }
+                    } else if self.state(f.conn).is_none() {
+                        // e.g. restored from an image without saved GPU state: the program gets an end
+                        self.to_proxy(Frame::new(wire::CLOSE, f.conn));
                     }
                 }
                 wire::CLOSE => self.close(f.conn),
@@ -394,7 +484,21 @@ impl Keeper {
                     self.move_all();
                     let _ = writer.send(wire::MOVED, 0, &[], &[]);
                 }
+                wire::FDS => {
+                    let mut r = self.restoring.lock().unwrap();
+                    let kept = r.entry(f.conn).or_default();
+                    for (i, fd) in f.fds.into_iter().enumerate() {
+                        if f.data.len() >= 4 * i + 4 {
+                            kept.insert(dw(&f.data, i), fd);
+                        }
+                    }
+                }
+                wire::RESTORE => {
+                    self.restore(f.conn, &f.data);
+                    let _ = writer.send(wire::RESTORED, f.conn, &[], &[]);
+                }
                 wire::DETACH => {
+                    self.save_all(&writer);
                     let mut s = self.shared.lock().unwrap();  // nothing more goes to the proxy until it attaches
                     s.link = None;
                     s.detached_since = Instant::now();
@@ -411,7 +515,8 @@ impl Keeper {
                         let _ = writer.frame(&frame);
                     }
                     s.link = Some(writer.clone());
-                    let _ = writer.send(wire::ATTACHED, 0, &[], &[]);
+                    let held: Vec<u8> = self.states.lock().unwrap().keys().flat_map(|c| c.to_le_bytes()).collect();
+                    let _ = writer.send(wire::ATTACHED, 0, &held, &[]);
                 }
                 _ => {}
             }

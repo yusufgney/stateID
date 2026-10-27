@@ -7,7 +7,9 @@
 //! drains and closes the link (`detach`), and opens it again afterwards (`attach`); meanwhile the keeper
 //! holds the server connections, so the GPU state survives, and buffers what the server sends. Bytes and
 //! SCM_RIGHTS fds are relayed unchanged; the keeper also follows what each connection has set up on the
-//! server (state.rs), so that it can be rebuilt.
+//! server (state.rs), so that it can be rebuilt. On detach it reads back what the GPU holds and hands
+//! the proxy each connection's saved state, which the frozen image then carries; a new keeper (after a
+//! restore) gets it back from the proxy on attach, with the shared memory the proxy kept, and rebuilds.
 //!
 //! usage:
 //!     stateid-vgpu keeper KEEPER_SOCK SERVER_SOCK [-- SERVER_COMMAND...]   (the server gets
@@ -22,7 +24,7 @@ mod wire;
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
@@ -70,6 +72,18 @@ fn remember_socket(i: usize, path: &Path) {
     SOCKETS[i].store(c.into_raw(), Ordering::SeqCst);
 }
 
+/// Keeper and proxy keep a copy of every live resource's shared memory: allow as many files as we may.
+/// Returns the limits before.
+fn most_files() -> [u64; 2] {
+    let mut lim = [0u64; 2];
+    unsafe {
+        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 {
+            setrlimit(RLIMIT_NOFILE, &[lim[1], lim[1]]);
+        }
+    }
+    lim
+}
+
 fn keeper(args: &[String]) -> i32 {
     if args.len() < 2 {
         return usage();
@@ -82,14 +96,7 @@ fn keeper(args: &[String]) -> i32 {
     let shm_sock = PathBuf::from(format!("{}.shm", keeper_sock.display()));
     remember_socket(0, &keeper_sock);
     remember_socket(2, &shm_sock);
-    unsafe {
-        // a copy of every live resource's shared memory is kept: allow as many files as we may
-        let mut lim = [0u64; 2];
-        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 {
-            lim[0] = lim[1];
-            setrlimit(RLIMIT_NOFILE, &lim);
-        }
-    }
+    most_files();
     if let Some(i) = args.iter().position(|a| a == "--") {
         let cmd = &args[i + 1..];
         if cmd.is_empty() {
@@ -123,6 +130,7 @@ fn proxy(args: &[String]) -> i32 {
     if i != 1 || program.is_empty() {
         return usage();
     }
+    let limits = most_files();
     let run_dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()));
     let listen = run_dir.join("gpu.vtest");
     let p = proxy::Proxy::new(PathBuf::from(&args[0]));
@@ -130,11 +138,24 @@ fn proxy(args: &[String]) -> i32 {
         eprintln!("stateid-vgpu: {e}");
         return 1;
     }
-    let status = Command::new(&program[0])
+    let mut program_cmd = Command::new(&program[0]);
+    unsafe {
+        // the program gets the usual limit back (select() breaks above 1024)
+        program_cmd.pre_exec(move || {
+            setrlimit(RLIMIT_NOFILE, &limits);
+            Ok(())
+        });
+    }
+    let status = program_cmd
         .args(&program[1..])
         .env("VTEST_SOCKET_NAME", &listen)
         .env("LIBGL_ALWAYS_SOFTWARE", "1")
         .env("GALLIUM_DRIVER", "virpipe")
+        // the session turns GL off for programs without the relay; here GL goes through it (Vulkan and
+        // dma-bufs would still reach devices the session cannot be frozen with)
+        .env("GDK_DISABLE", "dmabuf,vulkan")
+        .env_remove("GSK_RENDERER")
+        .env_remove("QT_XCB_GL_INTEGRATION")
         .status();
     match status {
         Ok(s) => s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)),

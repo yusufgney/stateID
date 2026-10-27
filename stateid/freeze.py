@@ -151,14 +151,23 @@ def restore(iid):
     if iid not in imgs:
         raise HelperError(f"no frozen image {iid}")
     from . import vgpu
-    if vgpu.is_wrapped(imgs[iid]["argv"]):
-        raise HelperError("restoring a session started with --gpu is not supported yet: its GPU state "
-                          "is not saved with the image")
+    gpu = vgpu.is_wrapped(imgs[iid]["argv"])
     for s in sessions()["sessions"]:
         if s["display"] == imgs[iid]["display"]:
             hide(s["sid"])
             call("stop", sid=s["sid"])
-    s = call("restore", iid=iid)
+    try:
+        if gpu:  # its GPU state comes back through a new keeper
+            vgpu.restart_keeper(imgs[iid]["argv"])
+        s = call("restore", iid=iid)
+        if gpu:
+            try:
+                vgpu.control(s["run_dir"], "attach", timeout=120)
+            except vgpu.GpuError:
+                call("stop", sid=s["sid"])  # it would wait for its GPU forever
+                raise
+    except vgpu.GpuError as e:
+        raise HelperError(str(e)) from e
     show(s)
     return s
 

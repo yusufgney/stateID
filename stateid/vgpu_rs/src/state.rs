@@ -258,6 +258,7 @@ pub struct Connection {
     pub pings: u32,               // the program's PING_PROTOCOL_VERSIONs not answered yet
     pub replies: Replies,         // what the server sends, split into answers
     pub contents: HashMap<u32, Vec<Vec<u8>>>,  // resource id -> what the GPU held, per level (read back)
+    pub forgotten: Vec<u32>,      // fd indexes of freed resources, for the keeper to pass on
 }
 
 /// Live resources in creation order.
@@ -309,6 +310,7 @@ impl Connection {
             pings: 0,
             replies: Replies::default(),
             contents: HashMap::new(),
+            forgotten: Vec::new(),
         }
     }
 
@@ -319,12 +321,14 @@ impl Connection {
     }
 
     // ------------------------------------------------------------------ feeding
-    pub fn from_client(&mut self, data: &[u8]) {
+    /// Follow what the program sent; returns what may go on to the server: whole commands only, so
+    /// the server never waits in the middle of one (the keeper may then speak to it in between).
+    pub fn from_client(&mut self, data: &[u8]) -> Vec<u8> {
         if self.lost {
-            return;
+            return data.to_vec();
         }
         self.buf.extend_from_slice(data);
-        let buf = std::mem::take(&mut self.buf);
+        let mut buf = std::mem::take(&mut self.buf);
         let mut pos = 0;
         while buf.len() - pos >= 8 {
             let length = dword(&buf[pos..], 0) as usize;
@@ -333,7 +337,7 @@ impl Connection {
             if cmd == TRANSFER_GET || cmd == TRANSFER_PUT {  // protocol 1: data follows outside the length
                 self.lost = true;
                 self.trouble("lost: protocol 1 transfers are not followed".into());
-                return;
+                return buf;  // everything goes on as it comes from now on
             }
             if buf.len() - pos < 8 + size {
                 break;
@@ -341,8 +345,8 @@ impl Connection {
             self.command(cmd, &buf[pos..pos + 8 + size]);
             pos += 8 + size;
         }
-        self.buf = buf;
-        self.buf.drain(..pos);
+        self.buf = buf.split_off(pos);
+        buf
     }
 
     /// The resource whose fd the server sends next, if one is expected.
@@ -399,8 +403,9 @@ impl Connection {
             RES_UNREF => {
                 if body.len() >= 4 {
                     let res = dword(body, 0);
-                    if let Some((create, _)) = self.resources.inner.remove(&res) {
+                    if let Some((create, fd)) = self.resources.inner.remove(&res) {
                         self.released.insert(res, create);
+                        self.forgotten.extend(fd);
                         self.free_ids.push(res);
                         self.shm.remove(&res);
                         self.contents.remove(&res);
@@ -529,6 +534,178 @@ impl Connection {
         self.setup.iter().map(|s| s.len()).sum::<usize>()
             + self.resources.inner.map.values().map(|(_, (r, _))| r.len()).sum::<usize>()
             + self.subs.values().map(|s| s.size()).sum::<usize>()
+    }
+}
+
+// ---------------------------------------------------------------- saving
+// A connection's state goes into the frozen session (the proxy keeps it), and a keeper started later
+// rebuilds from it; the shared memory travels as fds, by index. Little-endian, versioned.
+const SAVED: &[u8; 8] = b"stvgpu01";
+
+#[derive(Default)]
+struct Out(Vec<u8>);
+
+impl Out {
+    fn u32(&mut self, v: u32) {
+        self.0.extend(v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend(v.to_le_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+    fn list(&mut self, l: &[Vec<u8>]) {
+        self.u32(l.len() as u32);
+        l.iter().for_each(|b| self.bytes(b));
+    }
+    fn ids(&mut self, l: &[u32]) {
+        self.u32(l.len() as u32);
+        l.iter().for_each(|v| self.u32(*v));
+    }
+    fn ordered<K, V>(&mut self, o: &Ordered<K, V>, mut each: impl FnMut(&mut Self, &K, &V)) {
+        self.u64(o.seq);
+        self.u32(o.map.len() as u32);
+        for (k, (seq, v)) in &o.map {
+            self.u64(*seq);
+            each(self, k, v);
+        }
+    }
+}
+
+struct In<'a>(&'a [u8]);
+
+impl In<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8], String> {
+        if self.0.len() < n {
+            return Err("saved GPU state is cut short".into());
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn bytes(&mut self) -> Result<Vec<u8>, String> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+    fn list(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        (0..self.u32()?).map(|_| self.bytes()).collect()
+    }
+    fn ids(&mut self) -> Result<Vec<u32>, String> {
+        (0..self.u32()?).map(|_| self.u32()).collect()
+    }
+    fn handle(&mut self) -> Result<Handle, String> {
+        Ok(self.take(4)?.try_into().unwrap())
+    }
+    fn ordered<K: Hash + Eq, V>(&mut self, mut each: impl FnMut(&mut Self) -> Result<(K, V), String>)
+                                -> Result<Ordered<K, V>, String> {
+        let seq = self.u64()?;
+        let mut map = HashMap::new();
+        for _ in 0..self.u32()? {
+            let s = self.u64()?;
+            let (k, v) = each(self)?;
+            map.insert(k, (s, v));
+        }
+        Ok(Ordered { map, seq })
+    }
+}
+
+impl Connection {
+    /// Everything needed to rebuild this connection later, but its shared memory (see Resources::fd_index).
+    pub fn save(&self) -> Vec<u8> {
+        let mut o = Out::default();
+        o.0.extend_from_slice(SAVED);
+        o.list(&self.setup);
+        o.ordered(&self.resources.inner, |o, id, (create, fd)| {
+            o.u32(*id);
+            o.bytes(create);
+            o.u32(fd.map_or(u32::MAX, |f| f));
+        });
+        let released: Vec<_> = self.released.iter().collect();
+        o.u32(released.len() as u32);
+        released.iter().for_each(|(id, c)| { o.u32(**id); o.bytes(c); });
+        o.u32(self.next_id);
+        o.ids(&self.free_ids);
+        o.u32(self.fds_seen);
+        o.ids(&self.sub_order);
+        o.u32(self.sub);
+        o.u32(self.subs.len() as u32);
+        for (id, sub) in &self.subs {
+            o.u32(*id);
+            for objects in [&sub.objects, &sub.zombies] {
+                o.ordered(objects, |o, h, cmds| { o.0.extend_from_slice(h); o.list(cmds); });
+            }
+            o.ordered(&sub.settings, |o, k, cmd| { o.bytes(k); o.bytes(cmd); });
+            o.u32(sub.made_on.len() as u32);
+            for (h, (res, generation, create)) in &sub.made_on {
+                o.0.extend_from_slice(h);
+                o.u32(*res);
+                o.u64(*generation);
+                o.bytes(create);
+            }
+        }
+        o.u32(self.contents.len() as u32);
+        for (id, levels) in &self.contents {
+            o.u32(*id);
+            o.list(levels);
+        }
+        o.bytes(&self.buf);
+        o.0
+    }
+
+    /// The connection `save` described (its shared memory is added by the caller).
+    pub fn load(saved: &[u8]) -> Result<Connection, String> {
+        let mut i = In(saved);
+        if i.take(SAVED.len())? != SAVED {
+            return Err("saved GPU state is of another version".into());
+        }
+        let mut c = Connection::new();
+        c.setup = i.list()?;
+        c.resources.inner = i.ordered(|i| {
+            let id = i.u32()?;
+            let create = i.bytes()?;
+            let fd = i.u32()?;
+            Ok((id, (create, (fd != u32::MAX).then_some(fd))))
+        })?;
+        for _ in 0..i.u32()? {
+            let id = i.u32()?;
+            c.released.insert(id, i.bytes()?);
+        }
+        c.next_id = i.u32()?;
+        c.free_ids = i.ids()?;
+        c.fds_seen = i.u32()?;
+        c.sub_order = i.ids()?;
+        c.sub = i.u32()?;
+        c.subs.clear();
+        for _ in 0..i.u32()? {
+            let id = i.u32()?;
+            let mut sub = SubContext::new();
+            sub.objects = i.ordered(|i| Ok((i.handle()?, i.list()?)))?;
+            sub.zombies = i.ordered(|i| Ok((i.handle()?, i.list()?)))?;
+            sub.settings = i.ordered(|i| Ok((i.bytes()?, i.bytes()?)))?;
+            for _ in 0..i.u32()? {
+                let h = i.handle()?;
+                let made = (i.u32()?, i.u64()?, i.bytes()?);
+                sub.made_on.insert(h, made);
+            }
+            c.subs.insert(id, sub);
+        }
+        for _ in 0..i.u32()? {
+            let id = i.u32()?;
+            c.contents.insert(id, i.list()?);
+        }
+        c.buf = i.bytes()?;
+        if !i.0.is_empty() {
+            return Err("saved GPU state has more than expected".into());
+        }
+        Ok(c)
     }
 }
 
@@ -737,7 +914,7 @@ mod tests {
         let mut whole = Connection::new();
         whole.from_client(&stream);
         let mut parts = Connection::new();
-        stream.iter().for_each(|b| parts.from_client(&[*b]));
+        stream.iter().for_each(|b| { parts.from_client(&[*b]); });
         assert_eq!(whole.resources.ids(), vec![2]);
         assert_eq!(parts.resources.ids(), vec![2]);
         assert_eq!(whole.rebuild_commands(), parts.rebuild_commands());
@@ -846,6 +1023,36 @@ mod tests {
         assert_eq!(stand_ins, vec![tex]);
         let mut c = feed(&[create2(64), submit(&[ccmd(CREATE_OBJECT, 8, &[1, 1, 67, 0, 0])])]);
         assert_eq!(c.rebuild_commands_from(7).1.len(), 0);  // still there: no stand-in
+    }
+
+    #[test]
+    fn whole_commands_go_on_and_the_rest_waits() {
+        let mut c = Connection::new();
+        let cmd = create2(64);
+        assert_eq!(c.from_client(&cmd[..10]), b"");
+        assert_eq!(c.from_client(&[&cmd[10..], &unref(1)[..5]].concat()), cmd);
+        assert_eq!(c.from_client(&unref(1)[5..]), unref(1));
+    }
+
+    #[test]
+    fn a_saved_connection_rebuilds_the_same() {
+        let mut c = feed(&[vt(PROTOCOL_VERSION, &[3]), create2(64), create2(0), unref(1),
+                           submit(&[ccmd(CREATE_SUB_CTX, 0, &[1]), ccmd(SET_SUB_CTX, 0, &[1]),
+                                    ccmd(CREATE_OBJECT, 8, &[5, 2, 67, 0, 0]), ccmd(5, 0, &[1, 0, 5]),
+                                    ccmd(CREATE_OBJECT, 6, &[6, 2, 67, 0, 0]), ccmd(DESTROY_OBJECT, 6, &[6])])]);
+        c.from_server_fds(&fds(1));
+        c.contents.insert(2, vec![vec![1, 2, 3]]);
+        c.from_client(&create2(8)[..12]);  // half a command
+        let mut d = Connection::load(&c.save()).unwrap();
+        assert_eq!(d.setup, c.setup);
+        assert_eq!((d.resource_creates(), d.next_id, d.free_ids.clone()), (c.resource_creates(), c.next_id, c.free_ids.clone()));
+        assert_eq!(d.resources.generation(2), c.resources.generation(2));
+        assert_eq!(d.released, c.released);
+        assert_eq!(d.contents, c.contents);
+        assert_eq!(d.rebuild_commands_from(9), c.rebuild_commands_from(9));
+        assert_eq!(d.from_client(&create2(8)[12..]), create2(8));
+        assert!(Connection::load(b"stvgpu99").is_err());
+        assert!(Connection::load(&c.save()[..20]).is_err());
     }
 
     fn create2_of(target: u32, format: u32, w: u32, h: u32, depth: u32, array: u32, last: u32, size: u32) -> Vec<u8> {

@@ -1,6 +1,11 @@
 //! The proxy, inside the session: the program talks to it as if it were virgl_test_server. It keeps one
 //! link to the keeper and multiplexes every program connection over it; `detach` drains and closes the
 //! link before a freeze, `attach` opens it again.
+//!
+//! So that a frozen session can be restored later, the proxy keeps a copy of each shared-memory fd the
+//! server sent (until the keeper says it is freed), and on detach the keeper's saved state of every
+//! connection. A keeper that does not know these connections (a new one, after a restore) gets both
+//! back on attach and rebuilds them.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -25,6 +30,8 @@ pub struct Proxy {
     detached_cv: Condvar,
     moved: Mutex<bool>,
     moved_cv: Condvar,
+    kept: Mutex<HashMap<u32, (u32, HashMap<u32, OwnedFd>)>>,  // connection -> (fds so far, index -> fd)
+    saved: Mutex<HashMap<u32, Vec<u8>>>,                      // connection -> its state, from the last detach
     state: Mutex<()>,  // held while detaching/attaching
     gate: Mutex<()>,   // held while a frame goes out; DETACH takes it last
 }
@@ -47,6 +54,8 @@ impl Proxy {
             detached_cv: Condvar::new(),
             moved: Mutex::new(false),
             moved_cv: Condvar::new(),
+            kept: Mutex::new(HashMap::new()),
+            saved: Mutex::new(HashMap::new()),
             state: Mutex::new(()),
             gate: Mutex::new(()),
         })
@@ -56,13 +65,45 @@ impl Proxy {
         let s = UnixStream::connect(&self.keeper).map_err(|e| format!("cannot reach the GPU keeper: {e}"))?;
         let (mut reader, writer) = wire::link(s).map_err(|e| e.to_string())?;
         writer.send(wire::ATTACH, 0, &[], &[]).map_err(|e| e.to_string())?;
-        loop {
+        let held = loop {
             match reader.recv() {
                 None => return Err("the GPU keeper closed the link".into()),
-                Some(f) if f.kind == wire::ATTACHED => break,
+                Some(f) if f.kind == wire::ATTACHED => {
+                    break (0..f.data.len() / 4).map(|i| u32::from_le_bytes(f.data[4 * i..4 * i + 4].try_into().unwrap()))
+                        .collect::<std::collections::HashSet<u32>>();
+                }
                 Some(f) if f.kind == wire::REFUSED => {
                     return Err("the GPU keeper refused this session (its GPU state belongs to another copy)".into())
                 }
+                Some(f) => self.deliver(f),
+            }
+        };
+        // a keeper that does not hold our connections (a restored session) rebuilds them; before any
+        // request of the program, which waits until we are attached
+        let mut restoring = 0;
+        for (conn, saved) in std::mem::take(&mut *self.saved.lock().unwrap()) {
+            if held.contains(&conn) || !self.clients.lock().unwrap().contains_key(&conn) {
+                continue;
+            }
+            let kept = self.kept.lock().unwrap();
+            if let Some((_, fds)) = kept.get(&conn) {
+                let fds: Vec<(&u32, &OwnedFd)> = fds.iter().collect();
+                for part in fds.chunks(wire::MAX_FDS) {
+                    let index: Vec<u8> = part.iter().flat_map(|(i, _)| i.to_le_bytes()).collect();
+                    let copies: Vec<OwnedFd> = part.iter().filter_map(|(_, f)| f.try_clone().ok()).collect();
+                    if copies.len() == part.len() {
+                        writer.send(wire::FDS, conn, &index, &copies).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            drop(kept);
+            writer.send(wire::RESTORE, conn, &saved, &[]).map_err(|e| e.to_string())?;
+            restoring += 1;
+        }
+        while restoring > 0 {
+            match reader.recv() {
+                None => return Err("the GPU keeper closed the link".into()),
+                Some(f) if f.kind == wire::RESTORED => restoring -= 1,
                 Some(f) => self.deliver(f),
             }
         }
@@ -78,13 +119,37 @@ impl Proxy {
         let Some(c) = client else { return };  // its fds are closed when f is dropped
         match f.kind {
             wire::DATA => {
+                if !f.fds.is_empty() {
+                    let mut kept = self.kept.lock().unwrap();
+                    let (next, fds) = kept.entry(f.conn).or_default();
+                    for fd in &f.fds {
+                        if let Ok(copy) = fd.try_clone() {
+                            fds.insert(*next, copy);
+                        }
+                        *next += 1;
+                    }
+                }
                 let _ = wire::relay(c.as_raw_fd(), &f.data, &f.fds);
             }
+            wire::FORGET if f.data.len() == 4 => {
+                if let Some((_, fds)) = self.kept.lock().unwrap().get_mut(&f.conn) {
+                    fds.remove(&u32::from_le_bytes(f.data[..4].try_into().unwrap()));
+                }
+            }
+            wire::STATE => {
+                self.saved.lock().unwrap().insert(f.conn, f.data);
+            }
             wire::CLOSE => {
+                self.forget(f.conn);
                 let _ = c.shutdown(std::net::Shutdown::Write);
             }
             _ => {}
         }
+    }
+
+    fn forget(&self, conn: u32) {
+        self.kept.lock().unwrap().remove(&conn);
+        self.saved.lock().unwrap().remove(&conn);
     }
 
     fn read_link(&self, mut reader: LinkReader) {
@@ -129,6 +194,7 @@ impl Proxy {
             if n == 0 && fds.is_empty() {
                 self.send(wire::CLOSE, conn, &[], &[]);
                 self.clients.lock().unwrap().remove(&conn);
+                self.forget(conn);
                 return;
             }
             self.send(wire::DATA, conn, &buf[..n], &fds);
