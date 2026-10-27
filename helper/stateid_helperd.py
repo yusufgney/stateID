@@ -588,13 +588,16 @@ def session_init(spec):
     sid = spec["env"]["STATEID_SESSION"]
     # every process of the session carries its id, so nothing is left behind when it ends
     base_env = {"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"], "STATEID_SESSION": sid}
+    # a program on stateid-vgpu's relay (`stateid run --gpu`) draws through it, with no device and no
+    # /dev/udmabuf even over GLX, so GLX stays on for it
+    relay = os.path.basename(spec["argv"][0]).startswith("stateid-vgpu") and spec["argv"][1:2] == ["proxy"]
     xvnc = subprocess.Popen(
         [XVNC, f":{display}", "-geometry", spec["geometry"], "-depth", "24", "-rfbport", "-1",
          "-rfbunixpath", f"{rdir}/vnc.sock", "-rfbunixmode", "0600", "-SecurityTypes", "None",
          "-AlwaysShared", "-AcceptSetDesktopSize", "-nolisten", "tcp", "-extension", "MIT-SHM",
          # no GPU: an open /dev/dri render node cannot be checkpointed, and without GLX no program
          # creates a Mesa context (which opens /dev/udmabuf)
-         "-rendernode", "none", "-extension", "GLX",
+         "-rendernode", "none", *([] if relay else ["-extension", "GLX"]),
          "-desktop", f"{os.path.basename(spec['argv'][0])} (stateid {os.path.basename(rdir)})"],
         stdin=subprocess.DEVNULL, env=base_env)
     for _ in range(200):
