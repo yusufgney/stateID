@@ -264,3 +264,47 @@ def test_image_credentials_check_reads_criu_images(tmp_path):
         pycriu.images.dump(core, f)
     assert hd.image_credentials_ok(tmp_path, UID)
     assert not hd.image_credentials_ok(tmp_path, UID + 1)
+
+
+def tagged(sid, **env):
+    """A process of session `sid` that left its process tree (like a daemon of the program)."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            env={**os.environ, "STATEID_SESSION": sid, **env})
+
+
+def test_ended_session_leaves_no_processes_or_run_dir(helper, sleeper):
+    s = register(helper, sleeper.pid)
+    helper.run_dir(UID, s["sid"])
+    left, other = tagged(s["sid"]), tagged("bbbbbbbbbbbb")
+    try:
+        sleeper.kill()
+        sleeper.wait()
+        assert helper.sessions(UID) == {}  # noticing the end cleans up
+        assert left.wait(timeout=5) is not None
+        assert other.poll() is None  # another session's process is untouched
+        assert not (helper.run_base / str(UID) / s["sid"]).exists()
+    finally:
+        for p in (left, other):
+            p.kill()
+            p.wait()
+
+
+def test_run_dir_stays_while_an_image_needs_it(helper, sleeper):
+    s = register(helper, sleeper.pid)
+    rdir = helper.run_dir(UID, s["sid"])
+    meta = helper.handle(UID, {"op": "freeze", "sid": s["sid"]})
+    helper.handle(UID, {"op": "stop", "sid": s["sid"]})
+    assert rdir.exists()  # restoring reopens files the program had open there
+    helper.handle(UID, {"op": "delete", "iid": meta["iid"]})
+    assert not rdir.exists()
+
+
+def test_sweep_ends_what_a_killed_helper_left(helper):
+    rdir = helper.run_dir(UID, "cccccccccccc")
+    left = tagged("cccccccccccc")
+    try:
+        helper.sweep()
+        assert left.wait(timeout=5) is not None and not rdir.exists()
+    finally:
+        left.kill()
+        left.wait()

@@ -174,6 +174,41 @@ def killable(pids, uid, status=proc_status):
     return out
 
 
+def session_processes(sid, uid, status=proc_status):
+    """Processes still left from session `sid`: every process of the session gets STATEID_SESSION=<sid>
+    in its environment, including ones that left the session's process tree. Only the user's own
+    processes (see killable) are returned."""
+    tag = f"STATEID_SESSION={sid}".encode()
+    out = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            env = Path(f"/proc/{name}/environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if tag in env:
+            out.append(int(name))
+    return killable(out, uid, status)
+
+
+def end_session_processes(sid, uid, grace=2.0):
+    """SIGTERM what is left of a session, then SIGKILL whatever is still there after `grace` seconds."""
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 0)):
+        pids = session_processes(sid, uid)
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.time() + wait
+        while pids and time.time() < deadline:
+            time.sleep(0.05)
+            pids = [p for p in pids if proc_status(p) is not None]
+        if not pids:
+            return
+
+
 # ---------------------------------------------------------------- request validation
 def validate_start(req):
     argv = req.get("argv")
@@ -257,8 +292,9 @@ class Helper:
                 continue
             if self.alive(s):
                 out[s["sid"]] = s
-            else:
+            else:  # ended, or its first process was killed: nothing may outlive it
                 f.unlink(missing_ok=True)
+                self.clean_up(uid, s)
         return out
 
     def session(self, uid, sid):
@@ -435,7 +471,7 @@ class Helper:
             if not self.alive(s):
                 break
             time.sleep(0.05)
-        self.forget(uid, s)
+        self.clean_up(uid, s)
         return {"stopped": s["sid"]}
 
     def forget(self, uid, s):
@@ -444,9 +480,43 @@ class Helper:
             if not display_in_use(s["display"]):
                 Path(stale).unlink(missing_ok=True)
 
+    def clean_up(self, uid, s):
+        """After a session ended: stop its leftover processes and drop its runtime directory."""
+        end_session_processes(s["sid"], uid, grace=0.5)
+        self.forget(uid, s)
+        self.drop_run_dir(uid, s["sid"])
+
+    def sweep(self):
+        """At start-up: end what sessions that are gone left behind (processes, runtime directories)."""
+        for u in self.run_base.glob("*"):
+            if not (u.name.isdigit() and int(u.name) >= MIN_UID) or u.is_symlink():
+                continue
+            uid = int(u.name)
+            live = self.sessions(uid)
+            for d in u.iterdir():
+                if d.name not in live and ID_RE.match(d.name):
+                    end_session_processes(d.name, uid, grace=0.5)
+                    self.drop_run_dir(uid, d.name)
+
+    def drop_run_dir(self, uid, sid):
+        """Remove a session's runtime directory unless a frozen image still needs it (its program
+        has files there open, e.g. session.log, which restoring reopens)."""
+        if any(m.get("run_dir") == str(self.run_base / str(uid) / sid) for m in self.images(uid)):
+            return
+        d = self.run_base / str(uid) / valid_id(sid, "session id")
+        if d.is_dir() and not d.is_symlink():  # the parent belongs to root, so the user cannot swap it
+            shutil.rmtree(d, ignore_errors=True)
+
     def delete(self, uid, req):
         d = self.image_dir(uid, valid_id(req.get("iid"), "image id"))
+        try:
+            run_dir = Path(json.loads((d / "meta.json").read_text())["run_dir"])
+        except (OSError, ValueError, KeyError, TypeError):
+            run_dir = None
         shutil.rmtree(d)
+        if run_dir and run_dir.parent == self.run_base / str(uid) and not any(
+                s["sid"] == run_dir.name for s in self.sessions(uid).values()):
+            self.drop_run_dir(uid, run_dir.name)
         return {"deleted": d.name}
 
 
@@ -515,6 +585,9 @@ def session_init(spec):
     os.dup2(log, 2)
     import ctypes
     ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    sid = spec["env"]["STATEID_SESSION"]
+    # every process of the session carries its id, so nothing is left behind when it ends
+    base_env = {"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"], "STATEID_SESSION": sid}
     xvnc = subprocess.Popen(
         [XVNC, f":{display}", "-geometry", spec["geometry"], "-depth", "24", "-rfbport", "-1",
          "-rfbunixpath", f"{rdir}/vnc.sock", "-rfbunixmode", "0600", "-SecurityTypes", "None",
@@ -523,7 +596,7 @@ def session_init(spec):
          # creates a Mesa context (which opens /dev/udmabuf)
          "-rendernode", "none", "-extension", "GLX",
          "-desktop", f"{os.path.basename(spec['argv'][0])} (stateid {os.path.basename(rdir)})"],
-        stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"]})
+        stdin=subprocess.DEVNULL, env=base_env)
     for _ in range(200):
         if os.path.exists(f"/tmp/.X11-unix/X{display}"):
             break
@@ -531,7 +604,7 @@ def session_init(spec):
     wm = None
     if os.path.exists(WM):  # part of the session, so it is frozen and restored with the program
         wm = subprocess.Popen([WM, "-use_titlebar", "no", "-display", f":{display}"],
-                              stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"]})
+                              stdin=subprocess.DEVNULL, env=base_env)
     cwd = spec["cwd"] if os.path.isdir(spec["cwd"]) else spec["env"]["HOME"]
     app = subprocess.Popen([DBUS_RUN_SESSION, f"--config-file={rdir}/dbus.conf", "--", *spec["argv"]],
                            cwd=cwd, env=spec["env"], stdin=subprocess.DEVNULL)
@@ -550,6 +623,7 @@ def session_init(spec):
         for p in procs:
             if p.poll() is None:
                 p.kill()
+        end_session_processes(sid, os.getuid(), grace=1.0)  # what the program left running (D-Bus, helpers)
         os._exit(0)
 
     signal.signal(signal.SIGTERM, finish)
@@ -620,7 +694,9 @@ def main():
     if os.geteuid() != 0:
         sys.exit("stateid-helperd must run as root (it is started by systemd)")
     os.umask(0o077)
-    serve(Helper())
+    helper = Helper()
+    helper.sweep()
+    serve(helper)
 
 
 if __name__ == "__main__":
