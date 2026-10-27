@@ -39,6 +39,7 @@ examples:
   stateid list                    find an ID
   stateid DK-7SZKSJV0             go back to that moment
   stateid show DK-7SZKSJV0        what an agent should read to continue
+  stateid now --focused           the same for the window you are using, without saving
   stateid autosave --enable       save automatically whenever the windows change
 
 privacy: password managers and private/incognito windows are never captured;
@@ -84,6 +85,10 @@ def cmd_restore(args):
 
 def cmd_show(args):
     print(core.summary(args.id))
+
+
+def cmd_now(args):
+    print(core.now(focused=args.focused))
 
 
 def cmd_diff(args):
@@ -198,14 +203,20 @@ def build_parser():
     s = sub.add_parser("show", help="print the summary an agent should read to continue the work",
                        description="Print AGENT.md for a state: windows, documents, app state, terminal screens "
                                    "and paths to the screenshots.")
-    s.add_argument("id", help="a state ID")
+    s.add_argument("id", help='a state ID, or "latest" for the newest one')
     s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("now", help="print the same summary for the desktop right now, without saving",
+                       description="Read the open windows and print the agent summary (documents, app state, "
+                                   "terminal screens, text cursor) without saving a state or taking screenshots.")
+    s.add_argument("--focused", action="store_true", help="only the window that has the keyboard focus")
+    s.set_defaults(fn=cmd_now)
 
     s = sub.add_parser("diff", help="what changed since a state (or between two states)",
                        description="Show what changed between two states, or from a state to the desktop "
                                    "right now: windows opened and closed, and changed titles, documents, "
                                    "directories, tabs, pages and text cursors. Nothing is saved.")
-    s.add_argument("old", help="the earlier state ID")
+    s.add_argument("old", help='the earlier state ID, or "latest"')
     s.add_argument("new", nargs="?", help="the later state ID (default: the desktop now)")
     s.set_defaults(fn=cmd_diff)
 

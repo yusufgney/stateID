@@ -19,21 +19,22 @@ Then just talk to the agent:
 - *"Save my desktop"*: the agent takes a snapshot and gets an ID.
 - *"Continue from DK-7SZKSJV0"*: the agent reads what was open and where you were, then picks up the work.
 - *"What did I do since DK-7SZKSJV0?"*: the agent compares that moment with the desktop now.
-- *"What am I working on?"*: the agent lists the windows open right now.
+- *"Why does this fail?"*: the agent reads the window you are working in (nothing is saved).
 - *"Continue where I left off"*: with automatic saves on, the agent reads the newest state.
 - *"Restore DK-7SZKSJV0"*: the agent reopens and arranges everything.
 
 | Tool | What it does |
 |---|---|
+| `read_desktop` | What you are doing now (focused window or all), without saving |
 | `list_windows` | The windows open right now |
 | `save_state` | Snapshot the desktop or one window; returns an ID |
-| `get_state` | A state's summary, plus window screenshots if you allow them |
+| `get_state` | A state's summary (`latest` for the newest), plus screenshots if you allow them |
 | `diff_states` | What changed since a state, or between two states |
 | `list_states` | Saved states, newest first |
 | `restore_state` | Bring a state back on screen (only when you ask) |
 | `delete_state` | Delete a state |
 
-Without MCP, any agent that can run commands can use `stateid show ID`, which prints the same summary as Markdown.
+Without MCP, any agent that can run commands can use `stateid show ID` or `stateid now`, which print the same summary as Markdown.
 
 ## Install
 
@@ -54,7 +55,8 @@ Save with **Super+Shift+S**, from a window's title-bar menu, or with `stateid de
 stateid desktop             save the whole desktop
 stateid restore ID          bring the moment back (or just: stateid ID)
 stateid diff ID [ID2]       what changed since ID (or between two IDs)
-stateid list | show ID | delete ID
+stateid list | show ID | delete ID     (show latest: the newest state)
+stateid now [--focused]     the summary of the desktop now, without saving
 stateid autosave --enable   save automatically when the windows change (off by default)
 stateid run PROGRAM         start a program whose unsaved work is saved too
 stateid config [--init]     privacy settings

@@ -36,14 +36,26 @@ def new_id():
             return kid
 
 
+def resolve(kid):
+    """A state ID, or "latest" for the newest saved state (automatic ones included)."""
+    if (kid or "").strip().lower() == "latest":
+        rows = list_states(1)
+        if not rows:
+            raise StateNotFound("No saved states yet (`stateid save`, or turn on `stateid autosave --enable`)")
+        return rows[0]["id"]
+    return normalize(kid)
+
+
 def path(kid):
     return STORE / normalize(kid)
 
 
 def load(kid):
+    """A saved state by ID, or the newest one for "latest"."""
+    kid = resolve(kid)
     f = path(kid) / "state.json"
     if not f.exists():
-        raise StateNotFound(f"No such state: {normalize(kid)} (see `stateid list`)")
+        raise StateNotFound(f"No such state: {kid} (see `stateid list`)")
     return json.loads(f.read_text())
 
 
@@ -69,7 +81,7 @@ def list_states(limit=20):
 
 
 def delete(kid):
-    data = load(kid)
+    data = load(normalize(kid))  # a real ID only: "latest" must never pick what gets deleted
     from . import freeze  # frozen sessions saved in this state go with it
     for st in data["windows"]:
         iid = (st.get("app_state") or {}).get("frozen_image") if isinstance(st.get("app_state"), dict) else None
@@ -159,16 +171,18 @@ def _app_lines(a):
 def agent_md(kid, states, created, excluded=(), screenshots=True):
     """Markdown summary for agents: the focused window first, then every window's documents,
     place in the app and screen text. `states` must already be agent views (see core.agent_view).
-    Screenshot paths are listed only when the user lets agents see screenshots."""
+    Screenshot paths are listed only when the user lets agents see screenshots.
+    kid None: the desktop as read now, not saved."""
     focus = next((st for st in states if st["window"].get("focused")), states[0] if states else None)
-    lines = [f"# State {kid}", "", f"Saved {created}: {len(states)} window(s)."]
+    lines = [f"# State {kid}", "", f"Saved {created}: {len(states)} window(s)."] if kid else \
+        ["# Desktop now", "", f"Read {created}, not saved: {len(states)} window(s)."]
     if focus is not None:
         what = "a private window" if focus.get("private") else f"{focus['app']} — {focus['window']['title']}"
         lines.append(f"The user was working in **{what}**.")
     if excluded:
         lines.append(f"{len(excluded)} window(s) were not captured because of the user's privacy settings.")
-    lines += ["", f"Restore: `stateid restore {kid}` · Changes since then: `stateid diff {kid}`", ""]
-    if screenshots:
+    lines += ["", f"Restore: `stateid restore {kid}` · Changes since then: `stateid diff {kid}`", ""] if kid else [""]
+    if screenshots and kid:
         lines += ["Each window has a screenshot; look at it for anything not captured as data.", ""]
     for i, st in enumerate(states, 1):
         w = st["window"]

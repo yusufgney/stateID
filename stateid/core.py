@@ -86,14 +86,33 @@ def diff(old_id, new_id=None):
         new = store.load(new_id)
         new_views, created = [agent_view(st, cfg) for st in new["windows"]], new["created"]
     else:
-        with _lock:
-            wins = desktops.current().windows()
-            for w in wins:
-                w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
-            wins = [w for w in wins if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
-            states = _describe_all(wins, cfg)
+        states, _ = _read_now(cfg)
         new_views, created = [agent_view(st, cfg) for st in states], datetime.now().isoformat(timespec="seconds")
-    return diffs.report(old["id"], old["created"], old_views, new_id and store.normalize(new_id), created, new_views)
+    return diffs.report(old["id"], old["created"], old_views, new_id and new["id"], created, new_views)
+
+
+def _read_now(cfg, focused=False):
+    """Describe the windows open now (focused first), without saving. Returns (states, excluded app names)."""
+    with _lock:
+        wins = desktops.current().windows()
+        for w in wins:
+            w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
+        if focused:
+            wins = [w for w in wins if w["focused"]]
+        excluded = [w["app_name"] or w["wm_class"] for w in wins
+                    if privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
+        wins = [w for w in wins if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
+        return _describe_all(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"])), cfg), excluded
+
+
+def now(focused=False):
+    """The agent summary of the desktop right now (or only the focused window), read but not saved."""
+    cfg = privacy.load()
+    states, excluded = _read_now(cfg, focused)
+    if not states and not excluded:
+        raise LookupError("No focused window" if focused else "No windows are open")
+    return store.agent_md(None, [agent_view(st, cfg) for st in states], datetime.now().isoformat(timespec="seconds"),
+                          excluded, screenshots=False)
 
 
 def _lock_down(path):
@@ -439,7 +458,7 @@ def screenshots(kid, max_width=1280):
     for n, st in enumerate(data["windows"], 1):
         if is_private(st, cfg):
             continue
-        if st.get("screenshot") and (img := store.screenshot(kid, st["screenshot"], max_width)):
+        if st.get("screenshot") and (img := store.screenshot(data["id"], st["screenshot"], max_width)):
             title = privacy.redact(st["window"]["title"]) if cfg["privacy"]["redact"] else st["window"]["title"]
             out.append((n, st["app"], title, img))
     return out

@@ -17,12 +17,16 @@ stateid captures the user's GNOME desktop as a short state ID such as DK-7SZKSJV
 apps, documents, pages, selected tools (e.g. a red pen in a slideshow), browser tabs, terminal
 directories, text cursor positions and window placement, plus a screenshot of every window.
 
-- When the user mentions an ID (DK-XXXXXXXX) or asks to continue earlier work, call get_state
-  and read the summary (and screenshots, if the user allows them) before doing anything else.
-- Call list_windows or save_state to see what the user is doing right now.
-- To catch up after a known ID ("what did I do since DK-…?"), call diff_states with that ID.
-- If the user asks to continue without giving an ID, call list_states: the newest state (often
-  an automatic one, `auto: true`, if the user turned automatic saves on) shows where they were.
+Look at the desktop yourself instead of asking the user to describe or paste it:
+- The user refers to something on their screen you have not seen ("this error", "the document
+  I have open", "my terminal", "the page I'm on", "where was I?"): call read_desktop (scope
+  "focused" first). It reads the windows now, saves nothing and is cheap.
+- The user mentions an ID (DK-XXXXXXXX) or asks to continue earlier work: call get_state with
+  that ID, or with "latest" when no ID is given, before doing anything else.
+- To catch up ("what did I do since DK-…?", "since this morning"), call diff_states; use
+  list_states to find the right ID (automatic states, `auto: true`, appear when the user
+  turned them on).
+- Call save_state only when an ID is useful to keep (the user asks, or before a long task).
 - restore_state reopens and rearranges the user's windows: only call it when the user asks.
 - The user's privacy settings hide some windows ("private window") and mask secrets as
   [REDACTED]. Respect that: do not try to work around it or guess hidden content.
@@ -53,6 +57,18 @@ def list_windows() -> list[dict]:
         return core.list_windows()
 
 
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False,
+                                      open_world_hint=False))
+def read_desktop(scope: Literal["focused", "desktop"] = "focused") -> str:
+    """What the user is doing right now, read but not saved: for each window its documents, place in
+    the app (page, tabs, selected tool), working directory, terminal screen text and text cursor.
+
+    scope: "focused" for the window the user is working in, "desktop" for every window.
+    Use it whenever the user refers to something on their screen you have not seen."""
+    with expected_errors():
+        return core.now(focused=scope == "focused")
+
+
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
                                       open_world_hint=False))
 def save_state(scope: Literal["desktop", "focused"] = "desktop", window_seq: int | None = None,
@@ -71,7 +87,7 @@ def save_state(scope: Literal["desktop", "focused"] = "desktop", window_seq: int
 @mcp.tool(annotations=READ_ONLY)
 def diff_states(old_state_id: str, new_state_id: str | None = None) -> str:
     """What changed between two saved states, or since a state if new_state_id is omitted
-    (then the desktop is read now, without saving a new state).
+    (then the desktop is read now, without saving a new state). old_state_id may be "latest".
 
     Lists windows opened and closed, and for the others the changed title, documents, directory,
     browser tabs, pages and text cursor. Use it to catch up on what the user did since an ID."""
@@ -83,6 +99,7 @@ def diff_states(old_state_id: str, new_state_id: str | None = None) -> str:
 def get_state(state_id: str, include_screenshots: bool = True, max_screenshots: int = 4) -> list:
     """Read a saved state: what was open, where the user was in each app, and window screenshots.
 
+    state_id: an ID such as DK-7SZKSJV0, or "latest" for the newest saved state.
     Returns a Markdown summary (documents, slide/page, selected pen, browser tabs and URLs,
     terminal directories and screen text, text cursor) followed by up to `max_screenshots`
     screenshots, focused window first. Use it to continue the user's work from that moment."""
@@ -135,11 +152,26 @@ def state_resource(state_id: str) -> str:
 
 
 @mcp.prompt(title="Continue from a state ID")
-def continue_from_state(state_id: str) -> str:
-    """Pick up the user's work from a saved desktop state."""
+def continue_from_state(state_id: str = "latest") -> str:
+    """Pick up the user's work from a saved desktop state (the newest one by default)."""
     return (f"Call get_state for {state_id}. From the summary and screenshots, work out what I was doing "
             "and where I stopped (documents, pages, tools, terminal output). Summarise it in a few lines, "
             "then continue the task from there. Do not restore windows unless I ask.")
+
+
+@mcp.prompt(title="Look at my screen")
+def look_at_my_screen(question: str = "") -> str:
+    """Let the agent read the window the user is working in before answering."""
+    ask = f" Then answer: {question}" if question else " Then tell me in a few lines what you see I am doing."
+    return ("Call read_desktop with scope \"focused\" (and \"desktop\" if the focused window is not enough) "
+            f"to see what I am working on.{ask}")
+
+
+@mcp.prompt(title="Catch up since a state")
+def catch_up(state_id: str = "latest") -> str:
+    """Summarise what the user did since a saved state."""
+    return (f"Call diff_states with {state_id} to see what changed on my desktop since then. Summarise it "
+            "in a few lines: what I opened, closed and changed, and what I seem to be working on now.")
 
 
 def main():
