@@ -100,47 +100,94 @@ def screenshot(kid, name, max_width=1280, quality=80):
     return out.getvalue()
 
 
-def agent_md(kid, states, created, excluded=()):
-    """Markdown summary for agents. `states` must already be agent views (see core.agent_view)."""
-    lines = [f"# State {kid}", "",
-             f"Saved {created}. This is the user's desktop at that moment. Windows have screenshots "
-             "(`windowN.png`) in this folder; look at them for anything not captured as data.", "",
-             f"Restore with: `stateid restore {kid}`", ""]
+def _app_lines(a):
+    """Readable lines for the app state an adapter captured; unknown keys go last, compactly."""
+    a, out = dict(a), []
+    for note in ("warning", "error"):
+        if a.get(note):
+            out.append(f"- Note: {a.pop(note)}")
+    tabs, active = a.pop("tabs", None), a.pop("active_tab", None)
+    if isinstance(tabs, list) and tabs and any(isinstance(t, dict) and "url" in t for t in tabs):
+        out.append(f"- Browser tabs ({len(tabs)}):")
+        for i, t in enumerate(tabs[:20]):
+            out.append(f"  - {'**active** ' if i == active else ''}{t.get('title') or '?'} <{t.get('url')}>")
+        if len(tabs) > 20:
+            out.append(f"  - … {len(tabs) - 20} more")
+    elif isinstance(tabs, list) and tabs:
+        out.append(f"- Terminal tabs ({len(tabs)}):")
+        for t in tabs:
+            line = f"  - `{t.get('cwd') or '?'}`"
+            if t.get("running") and t["running"] != t.get("shell"):
+                line += f" running `{t['running']}`"
+            if t.get("claude_session"):
+                line += f" (Claude Code session {t['claude_session']})"
+            out.append(line)
+    for d in a.pop("documents", None) or []:
+        desc = f"slide/page {d['page'] + 1}/{d.get('pages')}" if d.get("page") is not None else ""
+        if d.get("pen"):
+            desc += f", pen {d['pen']['index'] + 1} selected (color {d['pen']['color']})"
+        if d.get("slideshow"):
+            ss = d["slideshow"]
+            desc += f", SLIDESHOW running at slide {ss['slide'] + 1}" + (f" with {ss['tool']} #{ss['color']}" if ss.get("tool") else "")
+        out.append(f"- {'**active** ' if d.get('active') else ''}`{d['path']}`: {desc}".rstrip(": "))
+    if a.get("document"):
+        page = a.pop("page", None)
+        out.append(f"- Document `{a.pop('document')}`" + (f", page {page + 1}" if isinstance(page, int) else ""))
+    if a.get("locations"):
+        out.append("- Folders: " + ", ".join(f"`{x}`" for x in a.pop("locations")))
+    if "folder" in a or "active_file" in a:
+        folder, f = a.pop("folder", None), a.pop("active_file", None)
+        out.append("- " + ", ".join(x for x in (folder and f"Project `{folder}`", f and f"active file `{f}`") if x))
+    if a.get("freeze_session"):
+        a.pop("freeze_session")
+        prog = " ".join(a.pop("program", None) or [])
+        out.append(f"- Freezable session running `{prog}`"
+                   + ("; its memory (unsaved work included) was saved" if a.pop("frozen_image", None) else ""))
+        a.pop("frozen_bytes", None)
+    for k in ("profile", "current_dir_label", "screen"):
+        a.pop(k, None)
+    if a:
+        text = json.dumps(a, ensure_ascii=False, separators=(", ", ": "))
+        out.append(f"- Other app state: `{text[:600]}{'…' if len(text) > 600 else ''}`")
+    return out
+
+
+def agent_md(kid, states, created, excluded=(), screenshots=True):
+    """Markdown summary for agents: the focused window first, then every window's documents,
+    place in the app and screen text. `states` must already be agent views (see core.agent_view).
+    Screenshot paths are listed only when the user lets agents see screenshots."""
+    focus = next((st for st in states if st["window"].get("focused")), states[0] if states else None)
+    lines = [f"# State {kid}", "", f"Saved {created}: {len(states)} window(s)."]
+    if focus is not None:
+        what = "a private window" if focus.get("private") else f"{focus['app']} — {focus['window']['title']}"
+        lines.append(f"The user was working in **{what}**.")
     if excluded:
-        lines += [f"{len(excluded)} window(s) were not captured because of the user's privacy settings.", ""]
+        lines.append(f"{len(excluded)} window(s) were not captured because of the user's privacy settings.")
+    lines += ["", f"Restore: `stateid restore {kid}` · Changes since then: `stateid diff {kid}`", ""]
+    if screenshots:
+        lines += ["Each window has a screenshot; look at it for anything not captured as data.", ""]
     for i, st in enumerate(states, 1):
+        w = st["window"]
+        flags = [x for x, on in (("focused", w.get("focused")), ("maximized", w.get("maximized")),
+                                 ("minimized", w.get("minimized"))) if on]
+        where = f"workspace {w['workspace']}" if w.get("workspace") is not None else ""
+        tags = ", ".join([x for x in [where] if x] + flags)
         if st.get("private"):
             lines += [f"## {i}. {st['app']} — private window", "",
                       "- Hidden by the user's privacy settings; restore still brings it back. "
                       "Do not try to find out what it contains.", ""]
             continue
-        w, r = st["window"], st["window"]["rect"]
         lines += [f"## {i}. {st['app']} — {w['title']}", ""]
-        lines.append(f"- Placement: workspace {w['workspace']}, {r['width']}x{r['height']} at {r['x']},{r['y']}"
-                     + (" (maximized)" if w["maximized"] else "") + (" (minimized)" if w["minimized"] else "")
-                     + (" — **focused window**" if w["focused"] else ""))
+        if tags:
+            lines.append(f"- Window: {tags}")
         if st.get("unsaved"):
             lines.append("- **Has unsaved changes** (title marker)")
         if st["cwd"]:
             lines.append(f"- Working directory: `{st['cwd']}`")
         if st["files"]:
             lines.append("- Open files: " + ", ".join(f"`{f}`" for f in st["files"][:15]))
-        a = dict(st["app_state"]) if isinstance(st["app_state"], dict) else {}
-        screen = a.pop("screen", None)
-        for d in a.get("documents", []):
-            desc = f"slide/page {d['page'] + 1}/{d.get('pages')}" if d.get("page") is not None else ""
-            if d.get("pen"):
-                desc += f", pen {d['pen']['index'] + 1} selected (color {d['pen']['color']})"
-            if d.get("slideshow"):
-                ss = d["slideshow"]
-                desc += f", SLIDESHOW running at slide {ss['slide'] + 1}" + (f" with {ss['tool']} #{ss['color']}" if ss.get("tool") else "")
-            lines.append(f"- {'**active** ' if d.get('active') else ''}`{d['path']}`: {desc}")
-        if a.get("tabs") and "active_tab" in a:
-            t = a["tabs"][a["active_tab"]]
-            lines.append(f"- Browser: {len(a['tabs'])} tabs, active: {t['title']} <{t['url']}>")
-        if a:
-            lines.append("- App state:")
-            lines += ["  ```json", *["  " + l for l in json.dumps(a, ensure_ascii=False, indent=1).splitlines()[:80]], "  ```"]
+        a = st["app_state"] if isinstance(st["app_state"], dict) else {}
+        lines += _app_lines(a)
         ui = st.get("ui") or {}
         for c in ui.get("carets", []):
             lines.append(f"- Text cursor: line {c['line']}, column {c['column']}" + (" (focused)" if c["focused"] else ""))
@@ -150,9 +197,9 @@ def agent_md(kid, states, created, excluded=()):
             lines.append("- Selected tabs: " + ", ".join(f"`{t['name']}`" for t in ui["tabs"]))
         if ui.get("texts"):
             lines.append("- Text fields: " + ", ".join(f"`{t['name'] or '?'}`=`{t['text'][:80]}`" for t in ui["texts"][:10]))
-        if screen:
-            lines += ["- Terminal screen (end):", "  ```", *["  " + l for l in screen.splitlines()[-40:]], "  ```"]
-        if st.get("screenshot"):
+        if a.get("screen"):
+            lines += ["- Terminal screen (end):", "  ```", *["  " + l for l in a["screen"].splitlines()[-30:]], "  ```"]
+        if screenshots and st.get("screenshot"):
             lines.append(f"- Screenshot: `{STORE / kid / st['screenshot']}`")
         lines.append("")
     return "\n".join(lines)

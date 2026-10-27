@@ -204,3 +204,19 @@ def test_restore_report_for_agents(saved):
     assert safe["windows"][0] == {"app": "Brave", "private": True, "status": "launched"}
     assert "whatsapp" not in text.lower() and "SECRET123" not in text and "hunter2" not in text
     assert safe["windows"][1]["launched"] == ["brave-browser …"]
+
+
+def test_summary_lists_screenshot_paths_only_when_agents_may_see_them(saved):
+    md = core.summary(saved)
+    assert "window1.png" not in md and "screenshot" not in md.lower()
+    write_config('[privacy]\nagent_screenshots = true\n')
+    md = core.summary(saved)
+    assert "window1.png" in md and "Each window has a screenshot" in md
+
+
+def test_summary_puts_the_focused_window_first_and_shows_data_once(saved):
+    md = core.summary(saved)
+    assert "The user was working in **Brave — WhatsApp - Brave**" in md
+    assert md.count("web.whatsapp.com") == 1 and "```json" not in md
+    assert "- `/home/me/project` running `bash`" in md
+    assert "stateid diff DK-TEST0001" in md

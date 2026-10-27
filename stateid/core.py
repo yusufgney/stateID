@@ -72,7 +72,8 @@ def summary(kid):
     cfg = privacy.load()
     data = store.load(kid)
     views = [agent_view(st, cfg) for st in data["windows"]]
-    return store.agent_md(data["id"], views, data["created"], data.get("excluded", []))
+    return store.agent_md(data["id"], views, data["created"], data.get("excluded", []),
+                          screenshots=cfg["privacy"]["agent_screenshots"])
 
 
 def diff(old_id, new_id=None):
@@ -228,7 +229,8 @@ def save(window=None, focused=False, copy=False, screenshots=True):
              "excluded": excluded_apps,
              "windows": states}, ensure_ascii=False, indent=1))
         views = [agent_view(st, cfg) for st in states]
-        (d / "AGENT.md").write_text(store.agent_md(kid, views, created, excluded_apps))
+        (d / "AGENT.md").write_text(store.agent_md(kid, views, created, excluded_apps,
+                                                   screenshots=p["agent_screenshots"]))
         _lock_down(d)
         if copy:
             shell.copy(kid)
