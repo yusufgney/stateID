@@ -12,10 +12,14 @@ connections, so the GPU state survives, and buffers what the server sends.
 Bytes and SCM_RIGHTS file descriptors are relayed unchanged; a descriptor stays on the one byte it
 was sent with (see relay_chunk). Nothing else is parsed, so any vtest client works.
 
+The server gets a small preloaded library (vgpu_staticbuf.c, built with the system C compiler on
+first use) that keeps its buffers in GPU memory on NVIDIA; without a compiler it runs, only slower.
+
 Not done yet: restoring a frozen image later brings the program back without its GPU state (the
 keeper's state belongs to the session that kept running), so its rendering breaks.
 """
 import array
+import hashlib
 import os
 import shutil
 import signal
@@ -357,9 +361,40 @@ def is_wrapped(argv):
     return len(argv) > 3 and argv[1:3] == ["-m", "stateid.vgpu"]
 
 
+def staticbuf_lib():
+    """Build vgpu_staticbuf.c once into the cache; None when it cannot be built."""
+    src = Path(__file__).with_name("vgpu_staticbuf.c")
+    try:
+        code = src.read_bytes()
+    except OSError:
+        return None
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "stateid"
+    lib = cache / f"staticbuf-{hashlib.sha256(code).hexdigest()[:12]}.so"
+    if lib.exists():
+        return lib
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        print("stateid: no C compiler, the GPU server runs without vgpu_staticbuf (slower on NVIDIA)",
+              file=sys.stderr)
+        return None
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp = lib.with_suffix(f".{os.getpid()}.tmp")
+    r = subprocess.run([cc, "-O2", "-shared", "-fPIC", "-o", str(tmp), str(src), "-ldl"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if r.returncode:
+        print("stateid: building vgpu_staticbuf failed:\n" + r.stderr, file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return None
+    tmp.replace(lib)
+    return lib
+
+
 def server_env(gpu):
     """Environment that makes virgl_test_server use one GPU: "intel"/"mesa" or "nvidia"."""
     env = dict(os.environ)
+    lib = staticbuf_lib()
+    if lib:
+        env["LD_PRELOAD"] = " ".join(filter(None, [str(lib), env.get("LD_PRELOAD")]))
     vendors = Path("/usr/share/glvnd/egl_vendor.d")
     if gpu == "nvidia":
         env["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(vendors / "10_nvidia.json")

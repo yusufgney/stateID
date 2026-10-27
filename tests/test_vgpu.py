@@ -109,3 +109,15 @@ def test_control_without_a_gpu_session(tmp_path):
 def test_wrapped_command_is_recognised():
     assert vgpu.is_wrapped(["/venv/python", "-m", "stateid.vgpu", "proxy", "/k", "--", "app"])
     assert not vgpu.is_wrapped(["app", "-m", "x"])
+
+
+def test_server_gets_the_staticbuf_library(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    if not (vgpu.shutil.which("cc") or vgpu.shutil.which("gcc")):
+        assert "LD_PRELOAD" not in vgpu.server_env("nvidia")  # runs without it
+        return
+    env = vgpu.server_env("nvidia")
+    lib = env["LD_PRELOAD"]
+    assert lib.startswith(str(tmp_path)) and os.path.exists(lib)
+    assert vgpu.server_env("intel")["LD_PRELOAD"] == lib  # built once

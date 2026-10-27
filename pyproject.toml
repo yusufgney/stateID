@@ -27,6 +27,9 @@ stateid-mcp = "stateid.mcp_server:main"
 [tool.setuptools]
 packages = ["stateid", "stateid.adapters"]
 
+[tool.setuptools.package-data]
+stateid = ["*.c"]
+
 [tool.setuptools.dynamic]
 version = { attr = "stateid.__version__" }
 
