@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -22,11 +22,12 @@ use crate::wire::{self, Frame, LinkReader, LinkWriter};
 pub struct Proxy {
     keeper: PathBuf,
     clients: Mutex<HashMap<u32, Arc<UnixStream>>>,
+    lost: AtomicBool,                               // the keeper is gone: no new connections either
     next_conn: AtomicU32,
     link: Mutex<Option<Arc<LinkWriter>>>,
     attached: Mutex<bool>,
     attached_cv: Condvar,
-    detached: Mutex<bool>,
+    detached: Mutex<Option<u32>>,  // after a detach: how many connections the keeper could not save
     detached_cv: Condvar,
     moved: Mutex<bool>,
     moved_cv: Condvar,
@@ -46,11 +47,12 @@ impl Proxy {
         Arc::new(Proxy {
             keeper,
             clients: Mutex::new(HashMap::new()),
+            lost: AtomicBool::new(false),
             next_conn: AtomicU32::new(1),
             link: Mutex::new(None),
             attached: Mutex::new(false),
             attached_cv: Condvar::new(),
-            detached: Mutex::new(false),
+            detached: Mutex::new(None),
             detached_cv: Condvar::new(),
             moved: Mutex::new(false),
             moved_cv: Condvar::new(),
@@ -156,7 +158,9 @@ impl Proxy {
         while let Some(f) = reader.recv() {
             if f.kind == wire::DETACH_ACK {
                 drop(reader);  // nothing of the link may stay open once detached
-                set(&self.detached, &self.detached_cv, true);
+                let unsaved = f.data.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+                *self.detached.lock().unwrap() = Some(unsaved);
+                self.detached_cv.notify_all();
                 return;
             }
             if f.kind == wire::MOVED {
@@ -164,6 +168,14 @@ impl Proxy {
                 continue;
             }
             self.deliver(f);
+        }
+        // the keeper is gone (not a detach): end the program's connections rather than leave it waiting
+        // for answers that cannot come
+        eprintln!("stateid-vgpu: lost the GPU keeper; closing the program's GPU connections");
+        let clients = self.clients.lock().unwrap();
+        self.lost.store(true, Ordering::SeqCst);
+        for c in clients.values() {
+            let _ = c.shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -201,13 +213,14 @@ impl Proxy {
         }
     }
 
-    fn detach(&self) -> Result<(), String> {
+    /// Returns a note for the user, empty when every connection was saved.
+    fn detach(&self) -> Result<String, String> {
         let _state = self.state.lock().unwrap();
         if !*self.attached.lock().unwrap() {
-            return Ok(());
+            return Ok(String::new());
         }
         set(&self.attached, &self.attached_cv, false);
-        *self.detached.lock().unwrap() = false;
+        *self.detached.lock().unwrap() = None;
         {
             let _gate = self.gate.lock().unwrap();  // waits for a frame being sent; later ones wait for attach
             if let Some(link) = self.link.lock().unwrap().clone() {
@@ -215,14 +228,17 @@ impl Proxy {
             }
         }
         let done = self.detached.lock().unwrap();
-        let (done, _) = self.detached_cv.wait_timeout_while(done, Duration::from_secs(10), |d| !*d).unwrap();
-        if !*done {
-            return Err("the GPU keeper did not answer".into());
-        }
+        let (done, _) = self.detached_cv.wait_timeout_while(done, Duration::from_secs(10), |d| d.is_none()).unwrap();
+        let Some(unsaved) = *done else { return Err("the GPU keeper did not answer".into()) };
+        drop(done);
         if let Some(link) = self.link.lock().unwrap().take() {
             link.shutdown();
         }
-        Ok(())
+        Ok(match unsaved {
+            0 => String::new(),
+            n => format!("the GPU state of {n} connection(s) could not be saved: after a restore the program \
+                          loses it"),
+        })
     }
 
     /// Have the keeper rebuild every connection on a new server connection; the program's requests
@@ -253,7 +269,8 @@ impl Proxy {
         Ok(())
     }
 
-    /// `detach` / `attach`, one per connection, answered with `ok` or an error line.
+    /// `detach` / `attach` / `move`, one per connection, answered with `ok` (maybe followed by a note
+    /// for the user) or an error line.
     fn serve_control(self: Arc<Self>, listener: UnixListener) {
         for c in listener.incoming() {
             let Ok(mut c) = c else { continue };
@@ -261,12 +278,13 @@ impl Proxy {
             let n = c.read(&mut buf).unwrap_or(0);
             let result = match String::from_utf8_lossy(&buf[..n]).trim() {
                 "detach" => self.detach(),
-                "attach" => self.attach(),
-                "move" => self.move_connections(),
+                "attach" => self.attach().map(|()| String::new()),
+                "move" => self.move_connections().map(|()| String::new()),
                 other => Err(format!("unknown command {other:?}")),
             };
             let _ = c.write_all(match result {
-                Ok(()) => "ok\n".to_string(),
+                Ok(note) if note.is_empty() => "ok\n".to_string(),
+                Ok(note) => format!("ok {note}\n"),
                 Err(e) => format!("error: {e}\n"),
             }.as_bytes());
         }
@@ -290,7 +308,12 @@ impl Proxy {
             for c in programs.incoming().flatten() {
                 let conn = me.next_conn.fetch_add(1, Ordering::SeqCst);
                 let c = Arc::new(c);
-                me.clients.lock().unwrap().insert(conn, c.clone());
+                let mut clients = me.clients.lock().unwrap();
+                if me.lost.load(Ordering::SeqCst) {
+                    continue;  // closed: there is no keeper to answer it
+                }
+                clients.insert(conn, c.clone());
+                drop(clients);
                 let me = me.clone();
                 std::thread::spawn(move || me.client(conn, c));
             }

@@ -129,9 +129,13 @@ def freeze(sid):
     session = next((s for s in sessions()["sessions"] if s["sid"] == sid), None)
     shown = hide(sid)
     try:
-        gpu = bool(session) and vgpu.control(session["run_dir"], "detach")
+        note = vgpu.ask(session["run_dir"], "detach") if session else None
+        gpu = note is not None
         try:
-            return call("freeze", sid=sid, leave_running=True)
+            meta = call("freeze", sid=sid, leave_running=True)
+            if note:
+                meta["warning"] = note
+            return meta
         finally:
             if gpu:
                 vgpu.control(session["run_dir"], "attach")

@@ -19,6 +19,7 @@ import pytest
 from stateid import vgpu
 
 RES_CREATE2 = 12
+GET_PARAM = 15
 FD_PLEASE = 70  # a made-up vtest command the fake server answers with an fd
 pytestmark = pytest.mark.skipif(not shutil.which("cargo"), reason="needs cargo to build stateid-vgpu")
 
@@ -51,7 +52,13 @@ def fake_server(path):
     srv.listen()
 
     def serve(c):
+        late, slow = b"", True  # the answer to the first PING waits for the next command (a slow server)
         while data := c.recv(4096):
+            if data == vt(10) and slow:
+                late, slow = vt(10), False
+                continue
+            c.sendall(late)
+            late = b""
             if data[4:8] == struct.pack("<I", RES_CREATE2):
                 c.sendall(struct.pack("<III", 1, RES_CREATE2, 1))
                 send_fd(c, os.memfd_create("res"))
@@ -62,6 +69,7 @@ def fake_server(path):
                 send_fd(c, fd)
             else:
                 c.sendall(data)
+        c.close()
 
     def loop():
         while True:
@@ -170,6 +178,60 @@ def test_nothing_is_lost_while_detached(gpu):
     c.settimeout(5)
     assert vgpu.control(f"{base}/run", "attach")
     assert recv_exactly(c, 12) == vt(99, 2)
+
+
+def test_a_move_gives_up_on_a_server_that_does_not_answer(gpu):
+    base = gpu[0]
+    c = client(base)
+    c.sendall(vt(GET_PARAM, 1))  # followed, so the keeper tries to pause the connection
+    assert recv_exactly(c, 12) == vt(GET_PARAM, 1)
+    started = time.monotonic()
+    assert vgpu.control(f"{base}/run", "move")
+    assert 4 < time.monotonic() - started < 10
+    c.sendall(vt(GET_PARAM, 2))  # now the server answers the keeper's ping too: that must not reach us
+    assert recv_exactly(c, 12) == vt(GET_PARAM, 2)
+    c.settimeout(0.3)
+    with pytest.raises(TimeoutError):
+        c.recv(100)
+    assert "connection 1 not moved" in Path(f"{base}/keeper.log").read_text()
+
+
+def test_a_late_answer_to_a_pause_that_gave_up_is_not_taken_for_the_next(gpu):
+    base = gpu[0]
+    c = client(base)
+    c.sendall(vt(GET_PARAM, 1))
+    assert recv_exactly(c, 12) == vt(GET_PARAM, 1)
+    assert vgpu.control(f"{base}/run", "move")  # gives up
+    assert vgpu.ask(f"{base}/run", "detach") == ""  # both answers come now; it stops at the second
+    assert vgpu.control(f"{base}/run", "attach")
+    c.sendall(vt(GET_PARAM, 2))
+    assert recv_exactly(c, 12) == vt(GET_PARAM, 2)
+    c.settimeout(0.3)
+    with pytest.raises(TimeoutError):
+        c.recv(100)
+
+
+def test_the_program_hears_when_the_keeper_is_gone(gpu):
+    base, _, keeper = gpu
+    c = client(base)
+    c.sendall(vt(99, 1))
+    assert recv_exactly(c, 12) == vt(99, 1)
+    keeper.kill()
+    keeper.wait()
+    assert c.recv(100) == b""  # instead of waiting forever
+    late = client(base)  # nor does a connection made afterwards
+    assert late.recv(100) == b""
+
+
+def test_a_detach_says_which_gpu_state_cannot_be_saved(gpu):
+    base = gpu[0]
+    assert vgpu.ask(f"{base}/run", "detach") == ""
+    assert vgpu.control(f"{base}/run", "attach")
+    c = client(base)
+    c.sendall(vt(99, 1))  # a command the keeper cannot rebuild (as Vulkan's are)
+    assert recv_exactly(c, 12) == vt(99, 1)
+    assert "of 1 connection(s) could not be saved" in vgpu.ask(f"{base}/run", "detach")
+    assert vgpu.control(f"{base}/run", "attach")
 
 
 def test_detached_proxy_keeps_no_link_open(gpu):
@@ -360,6 +422,22 @@ def test_wrapped_command_is_recognised():
     assert vgpu.is_wrapped(["/cache/stateid-vgpu-0123", "proxy", "/k", "--", "app"])
     assert vgpu.is_wrapped(["/venv/python", "-m", "stateid.vgpu", "proxy", "/k", "--", "app"])
     assert not vgpu.is_wrapped(["app", "-m", "x"])
+
+
+def test_old_keeper_logs_are_removed(tmp_path, monkeypatch):
+    old, recent, running = (tmp_path / f"{n}.log" for n in ("old", "recent", "running"))
+    for log in (old, recent, running):
+        log.write_text("x")
+    (tmp_path / "running.keeper").touch()
+    week_ago = time.time() - 7 * 86400
+    for log in (old, running):
+        os.utime(log, (week_ago, week_ago))
+    monkeypatch.setattr(vgpu, "binary", lambda: "/bin/true")  # the keeper never comes up
+    monkeypatch.setattr(vgpu, "server_env", lambda gpu: {})
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(vgpu.GpuError):
+        vgpu.start_keeper(tmp_path, "new")
+    assert not old.exists() and recent.exists() and running.exists()
 
 
 def test_server_gets_the_preload_library(tmp_path, monkeypatch):

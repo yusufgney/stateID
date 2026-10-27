@@ -16,6 +16,16 @@ use crate::wire::{self, Frame, LinkReader, LinkWriter};
 
 /// Without a proxy for this long the keeper gives up (a freeze takes seconds).
 const MAX_DETACHED: Duration = Duration::from_secs(600);
+/// How long the server may take to answer what it was sent before a pause gives up.
+const PAUSE_WAIT: Duration = Duration::from_secs(5);
+
+/// Our pings on a connection whose answers are still to come; the last one may park its pump.
+#[derive(Default)]
+struct Pause {
+    ours: u32,
+    park: bool,    // the pump stops at the last answer and gives the socket back
+    parked: bool,  // it did
+}
 
 struct Shared {
     link: Option<Arc<LinkWriter>>,
@@ -31,7 +41,7 @@ pub struct Keeper {
     states: Mutex<HashMap<u32, Arc<Mutex<Connection>>>>,  // what each connection set up there
     pumps: Mutex<HashMap<u32, JoinHandle<Option<UnixStream>>>>,  // they give the socket back when paused
     moving: Mutex<HashSet<u32>>,                          // their old server connection is closing
-    pausing: Mutex<HashSet<u32>>,                         // their pump stops at the answer to our ping
+    pausing: Mutex<HashMap<u32, Pause>>,                  // connections we sent pings on
     shm_offer: Mutex<HashMap<u32, OwnedFd>>,              // resource id -> shared memory, while rebuilding
     restoring: Mutex<HashMap<u32, HashMap<u32, OwnedFd>>>,  // connection -> fd index -> shared memory
 }
@@ -70,7 +80,7 @@ impl Keeper {
             states: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
             moving: Mutex::new(HashSet::new()),
-            pausing: Mutex::new(HashSet::new()),
+            pausing: Mutex::new(HashMap::new()),
             shm_offer: Mutex::new(HashMap::new()),
             restoring: Mutex::new(HashMap::new()),
         })
@@ -93,9 +103,9 @@ impl Keeper {
         self.states.lock().unwrap().get(&conn).cloned()
     }
 
-    /// Pass on what the server sends. While the connection is being paused only whole answers go on,
-    /// up to the answer to our ping: then the server owes the program nothing, and the socket is
-    /// given back.
+    /// Pass on what the server sends, without the answers to our pings. While the connection is being
+    /// paused only whole answers go on, up to the answer to our last ping: then the server owes the
+    /// program nothing, and the socket is given back.
     fn pump(&self, conn: u32, sock: UnixStream) -> Option<UnixStream> {
         let mut buf = vec![0u8; wire::CHUNK];
         let mut held = Vec::new();  // while pausing: the start of an answer not yet whole
@@ -111,55 +121,109 @@ impl Keeper {
                 }
                 return None;
             }
-            let pausing = self.pausing.lock().unwrap().contains(&conn);
-            let (mut base, mut whole, mut ours) = (0, None, None);  // stream positions
+            // stream positions: of `held`, after the last whole answer, of our answers, of the parking one
+            let (mut base, mut whole, mut ours, mut park) = (0, 0, Vec::new(), None);
             if let Some(st) = self.state(conn) {
                 let mut st = st.lock().unwrap();
                 if !fds.is_empty() {
                     st.from_server_fds(&fds);
                 }
                 base = st.replies.pos - held.len() as u64;
+                whole = base;
                 let framed = if fds.is_empty() { n } else { n.saturating_sub(1) };  // without the fd's byte
                 for (start, end, cmd) in st.replies.feed(&buf[..framed]) {
                     if cmd == state::PING_PROTOCOL_VERSION {
                         if st.pings > 0 {
-                            st.pings -= 1;
-                        } else if pausing {
-                            ours = Some(start);
-                            break;
+                            st.pings -= 1;  // (answers to pings are all alike, so their order does not matter)
+                        } else if let Some(p) = self.pausing.lock().unwrap().get_mut(&conn) {
+                            p.ours -= 1;
+                            if p.ours == 0 && p.park {
+                                p.parked = true;
+                                park = Some(start);
+                                break;
+                            }
+                            ours.push((start, end));
                         }
                     }
-                    whole = Some(end);
+                    whole = end;
                 }
             }
             held.extend_from_slice(&buf[..n]);
+            let pausing = {
+                let mut p = self.pausing.lock().unwrap();
+                if p.get(&conn).is_some_and(|p| p.ours == 0 && !p.park) {
+                    p.remove(&conn);  // a pause that gave up, now answered
+                }
+                p.contains_key(&conn)
+            };
             // an fd's byte comes after whole answers, and our ping is never followed by one
-            if !pausing || !fds.is_empty() {
-                self.to_proxy(Frame { kind: wire::DATA, conn, data: std::mem::take(&mut held), fds });
-                continue;
+            let upto = match park {
+                Some(p) => (p - base) as usize,
+                None if !pausing || !fds.is_empty() => held.len(),
+                None => (whole - base) as usize,
+            };
+            let mut data: Vec<u8> = held.drain(..upto).collect();
+            for &(start, end) in ours.iter().rev() {  // they go nowhere
+                data.drain((start - base) as usize..(end - base) as usize);
             }
-            let cut = ours.or(whole).map_or(0, |p| (p - base) as usize);
-            if cut > 0 {
-                let rest = held.split_off(cut);
-                self.to_proxy(Frame { kind: wire::DATA, conn, data: std::mem::replace(&mut held, rest), fds });
+            if !data.is_empty() || !fds.is_empty() {
+                self.to_proxy(Frame { kind: wire::DATA, conn, data, fds });
             }
-            if ours.is_some() {
-                return Some(sock);
+            if park.is_some() {
+                return Some(sock);  // nothing can follow: the program sends nothing meanwhile
             }
         }
     }
 
     /// Stop passing on what the server sends on `conn`, once it has answered all the program asked
-    /// (the program must not send more meanwhile), and take the server connection back.
+    /// (the program must not send more meanwhile), and take the server connection back. A server that
+    /// does not answer in time leaves the connection as it was (TimedOut).
     fn pause(&self, conn: u32) -> io::Result<UnixStream> {
         let up = self.upstreams.lock().unwrap().remove(&conn)
             .ok_or_else(|| io::Error::other("no server connection"))?;
-        self.pausing.lock().unwrap().insert(conn);
-        let sent = wire::send(up.as_raw_fd(), &[&vtest(state::PING_PROTOCOL_VERSION, &[])], &[]);
         let pump = self.pumps.lock().unwrap().remove(&conn);
+        let give_back = |up, pump: Option<JoinHandle<_>>| {
+            self.upstreams.lock().unwrap().insert(conn, up);
+            if let Some(pump) = pump {
+                self.pumps.lock().unwrap().insert(conn, pump);
+            }
+        };
+        {
+            let mut p = self.pausing.lock().unwrap();
+            let p = p.entry(conn).or_default();
+            p.ours += 1;
+            p.park = true;
+        }
+        if let Err(e) = wire::send(up.as_raw_fd(), &[&vtest(state::PING_PROTOCOL_VERSION, &[])], &[]) {
+            let mut p = self.pausing.lock().unwrap();
+            if let Some(q) = p.get_mut(&conn) {
+                q.ours -= 1;
+                q.park = false;
+                if q.ours == 0 {
+                    p.remove(&conn);
+                }
+            }
+            drop(p);
+            give_back(up, pump);
+            return Err(e);
+        }
+        let deadline = Instant::now() + PAUSE_WAIT;
+        while pump.as_ref().is_some_and(|p| !p.is_finished()) {
+            if Instant::now() > deadline {
+                let mut p = self.pausing.lock().unwrap();
+                if let Some(q) = p.get_mut(&conn).filter(|q| !q.parked) {
+                    q.park = false;  // its answer is dropped when it comes
+                    drop(p);
+                    give_back(up, pump);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut,
+                                              format!("the GPU server did not answer within {PAUSE_WAIT:?}")));
+                }
+                break;  // answered just now
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let parked = pump.and_then(|p| p.join().ok().flatten());
         self.pausing.lock().unwrap().remove(&conn);
-        sent?;
         parked.ok_or_else(|| io::Error::other("the server connection ended"))
     }
 
@@ -321,6 +385,12 @@ impl Keeper {
             let Some(st) = self.state(conn) else { continue };
             let followed = st.lock().unwrap().problem.is_none();
             let old = if followed { self.pause(conn) } else { Err(io::Error::other("not followed")) };
+            if let Err(e) = &old {
+                if e.kind() == io::ErrorKind::TimedOut {  // it still runs on the old connection
+                    eprintln!("stateid-vgpu: connection {conn} not moved: {e}");
+                    continue;
+                }
+            }
             let mut st = st.lock().unwrap();
             let read = match old {
                 Ok(old) => Self::read_contents(&mut st, &old).map(|r| (r, started.elapsed())),
@@ -359,11 +429,13 @@ impl Keeper {
 
     /// Before a freeze: give the proxy each connection's state with what the GPU holds, so that the
     /// frozen session carries it (a keeper started later rebuilds from it).
-    fn save_all(self: &Arc<Self>, writer: &LinkWriter) {
+    /// Returns how many connections could not be saved (they cannot come back with a restore).
+    fn save_all(self: &Arc<Self>, writer: &LinkWriter) -> u32 {
         let started = Instant::now();
         let mut conns: Vec<u32> = self.upstreams.lock().unwrap().keys().copied().collect();
         conns.sort_unstable();
         let (mut saved, mut bytes) = (0, 0);
+        let all = conns.len() as u32;
         for conn in conns {
             let Some(st) = self.state(conn) else { continue };
             if let Some(p) = &st.lock().unwrap().problem {
@@ -403,6 +475,7 @@ impl Keeper {
         }
         eprintln!("stateid-vgpu: {saved} connections saved for the freeze ({:.1} MB) in {:.0?}",
                   bytes as f64 / 1e6, started.elapsed());
+        all - saved
     }
 
     /// A restored session's proxy hands back a connection this keeper never had: rebuild it on the
@@ -498,11 +571,11 @@ impl Keeper {
                     let _ = writer.send(wire::RESTORED, f.conn, &[], &[]);
                 }
                 wire::DETACH => {
-                    self.save_all(&writer);
+                    let unsaved = self.save_all(&writer);
                     let mut s = self.shared.lock().unwrap();  // nothing more goes to the proxy until it attaches
                     s.link = None;
                     s.detached_since = Instant::now();
-                    let _ = writer.send(wire::DETACH_ACK, 0, &[], &[]);
+                    let _ = writer.send(wire::DETACH_ACK, 0, &unsaved.to_le_bytes(), &[]);
                     return;
                 }
                 wire::ATTACH => {

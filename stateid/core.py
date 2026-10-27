@@ -225,6 +225,8 @@ def freeze_sessions(states):
         try:
             meta = freeze.freeze(a["freeze_session"])
             a["frozen_image"], a["frozen_bytes"] = meta["iid"], meta["bytes"]
+            if meta.get("warning"):
+                a["freeze_warning"] = meta["warning"]
         except (freeze.HelperUnavailable, freeze.HelperError) as e:
             a["freeze_error"] = str(e)
 

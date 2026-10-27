@@ -32,6 +32,9 @@ class GpuError(RuntimeError):
     pass
 
 
+LOG_DAYS = 2  # keeper logs are kept this long after their keeper ended
+
+
 def cache_dir():
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "stateid"
 
@@ -62,10 +65,15 @@ def binary():
 
 # ---------------------------------------------------------------- control from stateid
 def control(run_dir, cmd, timeout=15):
-    """Send detach/attach to a session's proxy. False if the session has no GPU proxy."""
+    """Send detach/attach/move to a session's proxy. False if the session has no GPU proxy."""
+    return ask(run_dir, cmd, timeout) is not None
+
+
+def ask(run_dir, cmd, timeout=15):
+    """Like control(), but returns the proxy's note for the user ("" for none), None without a proxy."""
     path = Path(run_dir) / "gpu.ctl"
     if not path.exists():
-        return False
+        return None
     try:
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(timeout)
@@ -74,9 +82,9 @@ def control(run_dir, cmd, timeout=15):
             answer = s.recv(256).decode(errors="replace").strip()
     except OSError as e:
         raise GpuError(f"GPU proxy: {e}") from e
-    if answer != "ok":
+    if answer != "ok" and not answer.startswith("ok "):
         raise GpuError(f"GPU proxy: {answer or 'no answer'}")
-    return True
+    return answer[3:]
 
 
 def start_keeper(sock_dir, name, gpu=None):
@@ -84,6 +92,12 @@ def start_keeper(sock_dir, name, gpu=None):
     Both end when the session does."""
     sock_dir = Path(sock_dir)
     sock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for log in sock_dir.glob("*.log"):  # of keepers that ended a while ago
+        try:
+            if not log.with_suffix(".keeper").exists() and time.time() - log.stat().st_mtime > LOG_DAYS * 86400:
+                log.unlink()
+        except OSError:
+            pass
     server_sock, keeper_sock = sock_dir / f"{name}.vtest", sock_dir / f"{name}.keeper"
     keeper_sock.unlink(missing_ok=True)  # a stale one would look ready
     server = ["env", *(f"{k}={v}" for k, v in server_env(gpu).items()),
