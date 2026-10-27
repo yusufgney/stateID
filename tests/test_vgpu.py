@@ -2,8 +2,10 @@
 pass unchanged, nothing is lost while the proxy is detached for a freeze, a second copy of a session
 cannot take over, and the keeper follows and cleans up after each connection."""
 import array
+import mmap
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -88,9 +90,17 @@ def wait_for(path, proc=None):
 
 def start_proxy(exe, base, run_dir):
     os.makedirs(run_dir, exist_ok=True)
-    p = subprocess.Popen([exe, "proxy", f"{base}/keeper", "--", "sleep", "600"],
-                         env=dict(os.environ, XDG_RUNTIME_DIR=run_dir), stderr=subprocess.PIPE)
-    return p
+    # its own process group, so that ending it ends the program it runs too
+    return subprocess.Popen([exe, "proxy", f"{base}/keeper", "--", "sleep", "600"], start_new_session=True,
+                            env=dict(os.environ, XDG_RUNTIME_DIR=run_dir), stderr=subprocess.PIPE)
+
+
+def end(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    p.wait()
 
 
 @pytest.fixture
@@ -104,9 +114,9 @@ def gpu(exe):
     proxy = start_proxy(exe, base, f"{base}/run")
     wait_for(f"{base}/run/gpu.ctl", proxy)
     yield base, proxy, keeper
-    for p in (proxy, keeper):
-        p.kill()
-        p.wait()
+    end(proxy)
+    keeper.kill()
+    keeper.wait()
     shutil.rmtree(base)
 
 
@@ -167,7 +177,7 @@ def test_detached_proxy_keeps_no_link_open(gpu):
 def test_a_second_copy_is_refused(gpu, exe):
     base = gpu[0]
     other = start_proxy(exe, base, f"{base}/other")
-    assert other.wait(10) == 1
+    assert other.wait(10) == 1  # before it starts its program
     assert b"refused" in other.stderr.read()
 
 
@@ -200,8 +210,7 @@ def test_keeper_ends_with_its_session_and_stops_the_server(exe):
         assert len(children) == 1
         proxy = start_proxy(exe, base, f"{base}/run")
         wait_for(f"{base}/run/gpu.ctl", proxy)
-        proxy.kill()  # the session ends without detaching
-        proxy.wait()
+        end(proxy)  # the session ends without detaching
         assert keeper.wait(5) == 0
         time.sleep(0.2)
         assert not os.path.exists(f"/proc/{children[0]}/cmdline") or \
@@ -209,6 +218,53 @@ def test_keeper_ends_with_its_session_and_stops_the_server(exe):
         assert not os.path.exists(f"{base}/keeper") and not os.path.exists(f"{base}/vtest")
     finally:
         keeper.kill()
+        shutil.rmtree(base)
+
+
+def vt(cmd, *dwords):
+    return struct.pack(f"<II{len(dwords)}I", len(dwords), cmd, *dwords)
+
+
+@pytest.mark.skipif(not shutil.which("virgl_test_server"), reason="needs virgl_test_server")
+def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory(exe, request, monkeypatch):
+    """A buffer filled through shared memory survives moving to a new server: the new server reads the
+    program's own memory (no copy), which a read-back on the new server proves."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(request.config.cache.mkdir("stateid-vgpu")))
+    base = f"/tmp/sgt-{os.getpid()}-{time.monotonic_ns()}"
+    os.mkdir(base)
+    keeper_sock = vgpu.start_keeper(base, "k")
+    proxy = subprocess.Popen([exe, "proxy", keeper_sock, "--", "sleep", "600"], start_new_session=True,
+                             env=dict(os.environ, XDG_RUNTIME_DIR=base))
+    try:
+        wait_for(f"{base}/gpu.ctl", proxy)
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(f"{base}/gpu.vtest")
+        c.settimeout(10)
+        c.sendall(struct.pack("<II", 4, 8) + b"test")  # CREATE_RENDERER
+        c.sendall(vt(11, 3))  # PROTOCOL_VERSION
+        assert recv_exactly(c, 12)[:8] == struct.pack("<II", 1, 11)
+        c.sendall(vt(RES_CREATE2, 0, 0, 64, 0x10, 64, 1, 1, 1, 0, 0, 64))  # a 64-byte buffer with shm
+        res = struct.unpack("<III", recv_exactly(c, 12))[2]
+        _, fds = recv_chunk(c)
+        shm = mmap.mmap(fds[0], 64)
+        os.close(fds[0])
+
+        def transfer(cmd):  # TRANSFER_PUT2 / GET2 of the whole buffer, then wait until it is done
+            c.sendall(vt(cmd, res, 0, 0, 0, 0, 64, 1, 1, 0, 0) + vt(7, res, 1))
+            recv_exactly(c, 12)
+        shm[:5] = b"hello"
+        transfer(14)
+        assert vgpu.control(base, "move")
+        shm[:5] = bytes(5)
+        transfer(13)  # read back from the new server into our memory
+        assert shm[:5] == b"hello"
+        assert "connection 1 rebuilt" in Path(f"{base}/k.log").read_text()
+    finally:
+        end(proxy)
+        for _ in range(100):  # the keeper ends with the session and stops its server
+            if not os.path.exists(keeper_sock):
+                break
+            time.sleep(0.05)
         shutil.rmtree(base)
 
 
@@ -222,7 +278,7 @@ def test_wrapped_command_is_recognised():
     assert not vgpu.is_wrapped(["app", "-m", "x"])
 
 
-def test_server_gets_the_staticbuf_library(tmp_path, monkeypatch):
+def test_server_gets_the_preload_library(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.delenv("LD_PRELOAD", raising=False)
     if not (shutil.which("cc") or shutil.which("gcc")):

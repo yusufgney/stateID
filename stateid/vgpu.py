@@ -7,8 +7,9 @@ The proxy and the keeper are one Rust program, stateid-vgpu (vgpu_rs/; see its m
 cargo on first use into the cache. This module builds and starts it, and sends `detach`/`attach` to a
 session's proxy around a freeze.
 
-The server gets a small preloaded library (vgpu_staticbuf.c, built with the system C compiler on
-first use) that keeps its buffers in GPU memory on NVIDIA; without a compiler it runs, only slower.
+The server gets a small preloaded library (vgpu_preload.c, built with the system C compiler on
+first use) that keeps its buffers in GPU memory on NVIDIA and lets the keeper hand it shared memory when it
+rebuilds a program's state; without a compiler it runs, only slower.
 
 Not done yet: restoring a frozen image later brings the program back without its GPU state (the
 keeper's state belongs to the session that kept running), so its rendering breaks.
@@ -109,20 +110,20 @@ def is_wrapped(argv):
             or len(argv) > 3 and Path(argv[0]).name.startswith("stateid-vgpu") and argv[1] == "proxy")
 
 
-def staticbuf_lib():
-    """Build vgpu_staticbuf.c once into the cache; None when it cannot be built."""
-    src = Path(__file__).with_name("vgpu_staticbuf.c")
+def preload_lib():
+    """Build vgpu_preload.c once into the cache; None when it cannot be built."""
+    src = Path(__file__).with_name("vgpu_preload.c")
     try:
         code = src.read_bytes()
     except OSError:
         return None
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "stateid"
-    lib = cache / f"staticbuf-{hashlib.sha256(code).hexdigest()[:12]}.so"
+    lib = cache / f"preload-{hashlib.sha256(code).hexdigest()[:12]}.so"
     if lib.exists():
         return lib
     cc = shutil.which("cc") or shutil.which("gcc")
     if not cc:
-        print("stateid: no C compiler, the GPU server runs without vgpu_staticbuf (slower on NVIDIA)",
+        print("stateid: no C compiler, the GPU server runs without vgpu_preload (slower on NVIDIA, cannot be rebuilt)",
               file=sys.stderr)
         return None
     cache.mkdir(parents=True, exist_ok=True)
@@ -130,7 +131,7 @@ def staticbuf_lib():
     r = subprocess.run([cc, "-O2", "-shared", "-fPIC", "-o", str(tmp), str(src), "-ldl"],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
     if r.returncode:
-        print("stateid: building vgpu_staticbuf failed:\n" + r.stderr, file=sys.stderr)
+        print("stateid: building vgpu_preload failed:\n" + r.stderr, file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return None
     tmp.replace(lib)
@@ -140,7 +141,7 @@ def staticbuf_lib():
 def server_env(gpu):
     """Environment variables that make virgl_test_server use one GPU: "intel"/"mesa" or "nvidia"."""
     env = {}
-    lib = staticbuf_lib()
+    lib = preload_lib()
     if lib:
         env["LD_PRELOAD"] = " ".join(filter(None, [str(lib), os.environ.get("LD_PRELOAD")]))
     vendors = Path("/usr/share/glvnd/egl_vendor.d")

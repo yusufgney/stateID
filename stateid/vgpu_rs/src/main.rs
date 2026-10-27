@@ -10,7 +10,8 @@
 //! server (state.rs), so that it can be rebuilt.
 //!
 //! usage:
-//!     stateid-vgpu keeper KEEPER_SOCK SERVER_SOCK [-- SERVER_COMMAND...]
+//!     stateid-vgpu keeper KEEPER_SOCK SERVER_SOCK [-- SERVER_COMMAND...]   (the server gets
+//!         $STATEID_VGPU_SHM=KEEPER_SOCK.shm for its preloaded library, see vgpu_preload.c)
 //!     stateid-vgpu proxy KEEPER_SOCK -- PROGRAM [ARGS...]     (in the session; serves $XDG_RUNTIME_DIR/gpu.*)
 //!     stateid-vgpu check-log LOG     (development: follow a recorded session, check resource IDs)
 
@@ -33,12 +34,15 @@ extern "C" {
     fn unlink(path: *const c_char) -> c_int;
     fn umask(mask: u32) -> u32;
     fn _exit(code: c_int) -> !;
+    fn getrlimit(resource: c_int, rlim: *mut [u64; 2]) -> c_int;
+    fn setrlimit(resource: c_int, rlim: *const [u64; 2]) -> c_int;
 }
+const RLIMIT_NOFILE: c_int = 7;
 const SIGTERM: c_int = 15;
 
 // what the keeper cleans up when it ends, also from a signal handler
 static SERVER_PID: AtomicI32 = AtomicI32::new(0);
-static SOCKETS: [AtomicPtr<c_char>; 2] = [AtomicPtr::new(std::ptr::null_mut()), AtomicPtr::new(std::ptr::null_mut())];
+static SOCKETS: [AtomicPtr<c_char>; 3] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 3];
 
 extern "C" fn end_keeper(_: c_int) {
     unsafe {
@@ -75,7 +79,17 @@ fn keeper(args: &[String]) -> i32 {
         umask(0o077);  // the server socket gives full access to the GPU state: this user only
         signal(SIGTERM, end_keeper as extern "C" fn(c_int) as usize);  // so the server is stopped too
     }
+    let shm_sock = PathBuf::from(format!("{}.shm", keeper_sock.display()));
     remember_socket(0, &keeper_sock);
+    remember_socket(2, &shm_sock);
+    unsafe {
+        // a copy of every live resource's shared memory is kept: allow as many files as we may
+        let mut lim = [0u64; 2];
+        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 {
+            lim[0] = lim[1];
+            setrlimit(RLIMIT_NOFILE, &lim);
+        }
+    }
     if let Some(i) = args.iter().position(|a| a == "--") {
         let cmd = &args[i + 1..];
         if cmd.is_empty() {
@@ -83,7 +97,7 @@ fn keeper(args: &[String]) -> i32 {
         }
         let _ = std::fs::remove_file(&server_sock);
         remember_socket(1, &server_sock);
-        match Command::new(&cmd[0]).args(&cmd[1..]).stdin(Stdio::null()).spawn() {
+        match Command::new(&cmd[0]).args(&cmd[1..]).env("STATEID_VGPU_SHM", &shm_sock).stdin(Stdio::null()).spawn() {
             Ok(child) => SERVER_PID.store(child.id() as i32, Ordering::SeqCst),
             Err(e) => {
                 eprintln!("stateid-vgpu: cannot start {}: {e}", cmd[0]);
@@ -97,7 +111,7 @@ fn keeper(args: &[String]) -> i32 {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    if let Err(e) = keeper::Keeper::new(server_sock).run(keeper_sock, keeper_done) {
+    if let Err(e) = keeper::Keeper::new(server_sock).run(keeper_sock, &shm_sock, keeper_done) {
         eprintln!("stateid-vgpu: keeper: {e}");
     }
     keeper_done()
@@ -157,7 +171,7 @@ fn check_log(args: &[String]) -> i32 {
                 }
             }
         }
-        c.from_server_fds(nfds);
+        c.from_server_fds(&(0..nfds).map(|_| std::fs::File::open("/dev/null").unwrap().into()).collect::<Vec<_>>());
     }
     for (id, c) in conns.iter_mut() {
         println!("connection {id}: kept {} bytes, {} resources, rebuild {} bytes, could rebuild: {}", c.size(),

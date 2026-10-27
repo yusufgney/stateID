@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+use std::os::fd::OwnedFd;
 
 // vtest commands
 pub const GET_CAPS: u32 = 1;
@@ -209,6 +210,7 @@ pub struct Connection {
     pub next_id: u32,
     pub free_ids: Vec<u32>,
     fd_waiting: VecDeque<u32>,  // resource ids whose fd the server has yet to send, in order
+    pub shm: HashMap<u32, OwnedFd>,  // our copy of each live resource's shared memory
     fds_seen: u32,
     subs: HashMap<u32, SubContext>,
     sub_order: Vec<u32>,
@@ -251,6 +253,7 @@ impl Connection {
             next_id: 1,
             free_ids: Vec::new(),
             fd_waiting: VecDeque::new(),
+            shm: HashMap::new(),
             fds_seen: 0,
             subs,
             sub_order: vec![0],
@@ -298,9 +301,10 @@ impl Connection {
         self.fd_waiting.front().copied()
     }
 
-    /// The server sent n file descriptors (they come in the order they were asked for).
-    pub fn from_server_fds(&mut self, n: usize) {
-        for _ in 0..n {
+    /// The server sent file descriptors (they come in the order they were asked for); a copy of each
+    /// is kept while its resource lives.
+    pub fn from_server_fds(&mut self, fds: &[OwnedFd]) {
+        for f in fds {
             let index = self.fds_seen;
             self.fds_seen += 1;
             match self.fd_waiting.pop_front() {
@@ -308,6 +312,12 @@ impl Connection {
                 Some(res) => {
                     if let Some((_, fd)) = self.resources.inner.get_mut(&res) {
                         *fd = Some(index);
+                        match f.try_clone() {
+                            Ok(copy) => {
+                                self.shm.insert(res, copy);
+                            }
+                            Err(e) => self.trouble(format!("cannot keep a shared memory fd: {e}")),
+                        }
                     }
                 }
             }
@@ -341,6 +351,7 @@ impl Connection {
                     let res = dword(body, 0);
                     if self.resources.inner.remove(&res).is_some() {
                         self.free_ids.push(res);
+                        self.shm.remove(&res);
                     }
                 }
             }
@@ -407,6 +418,19 @@ impl Connection {
     }
 
     // ------------------------------------------------------------------ rebuilding
+    /// The live resources by id: (id, encoded create command).
+    pub fn resource_creates(&self) -> Vec<(u32, Vec<u8>)> {
+        let mut out: Vec<_> = self.resources.inner.map.iter().map(|(id, (_, (raw, _)))| (*id, raw.clone())).collect();
+        out.sort_unstable_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// After a rebuild the new server hands out IDs from its own free list.
+    pub fn renumbered(&mut self, next_id: u32, free_ids: Vec<u32>) {
+        self.next_id = next_id;
+        self.free_ids = free_ids;
+    }
+
     /// The virgl command buffer that recreates every sub-context (resources must exist first).
     pub fn rebuild_commands(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -471,6 +495,10 @@ mod tests {
         out
     }
 
+    fn fds(n: usize) -> Vec<OwnedFd> {
+        (0..n).map(|_| std::fs::File::open("/dev/null").unwrap().into()).collect()
+    }
+
     fn feed(stream: &[Vec<u8>]) -> Connection {
         let mut c = Connection::new();
         c.from_client(&stream.concat());
@@ -492,11 +520,14 @@ mod tests {
     #[test]
     fn shared_memory_fds_belong_to_the_resources_that_asked() {
         let mut c = feed(&[create2(0), create2(4096), create2(4096)]);
-        c.from_server_fds(1);
-        c.from_server_fds(1);
+        c.from_server_fds(&fds(1));
+        c.from_server_fds(&fds(1));
         assert_eq!([1, 2, 3].map(|r| c.resources.fd_index(r)), [None, Some(0), Some(1)]);
+        assert_eq!(c.shm.len(), 2);
         assert!(c.problem.is_none());
-        c.from_server_fds(1);
+        c.from_client(&unref(2));
+        assert!(!c.shm.contains_key(&2) && c.shm.contains_key(&3));  // the copy goes with the resource
+        c.from_server_fds(&fds(1));
         assert!(c.problem.unwrap().contains("no resource asked"));
     }
 

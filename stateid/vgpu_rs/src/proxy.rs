@@ -23,6 +23,8 @@ pub struct Proxy {
     attached_cv: Condvar,
     detached: Mutex<bool>,
     detached_cv: Condvar,
+    moved: Mutex<bool>,
+    moved_cv: Condvar,
     state: Mutex<()>,  // held while detaching/attaching
     gate: Mutex<()>,   // held while a frame goes out; DETACH takes it last
 }
@@ -43,6 +45,8 @@ impl Proxy {
             attached_cv: Condvar::new(),
             detached: Mutex::new(false),
             detached_cv: Condvar::new(),
+            moved: Mutex::new(false),
+            moved_cv: Condvar::new(),
             state: Mutex::new(()),
             gate: Mutex::new(()),
         })
@@ -89,6 +93,10 @@ impl Proxy {
                 drop(reader);  // nothing of the link may stay open once detached
                 set(&self.detached, &self.detached_cv, true);
                 return;
+            }
+            if f.kind == wire::MOVED {
+                set(&self.moved, &self.moved_cv, true);
+                continue;
             }
             self.deliver(f);
         }
@@ -151,6 +159,26 @@ impl Proxy {
         Ok(())
     }
 
+    /// Have the keeper rebuild every connection on a new server connection; the program's requests
+    /// wait meanwhile.
+    fn move_connections(&self) -> Result<(), String> {
+        let _state = self.state.lock().unwrap();
+        if !*self.attached.lock().unwrap() {
+            return Err("not attached".into());
+        }
+        *self.moved.lock().unwrap() = false;
+        let _gate = self.gate.lock().unwrap();
+        if let Some(link) = self.link.lock().unwrap().clone() {
+            link.send(wire::MOVE, 0, &[], &[]).map_err(|e| e.to_string())?;
+        }
+        let done = self.moved.lock().unwrap();
+        let (done, _) = self.moved_cv.wait_timeout_while(done, Duration::from_secs(60), |d| !*d).unwrap();
+        if !*done {
+            return Err("the GPU keeper did not finish moving".into());
+        }
+        Ok(())
+    }
+
     fn attach(self: &Arc<Self>) -> Result<(), String> {
         let _state = self.state.lock().unwrap();
         if !*self.attached.lock().unwrap() {
@@ -168,6 +196,7 @@ impl Proxy {
             let result = match String::from_utf8_lossy(&buf[..n]).trim() {
                 "detach" => self.detach(),
                 "attach" => self.attach(),
+                "move" => self.move_connections(),
                 other => Err(format!("unknown command {other:?}")),
             };
             let _ = c.write_all(match result {

@@ -169,6 +169,8 @@ pub const DETACH_ACK: u8 = 5;
 pub const ATTACH: u8 = 6;
 pub const ATTACHED: u8 = 7;
 pub const REFUSED: u8 = 8;
+pub const MOVE: u8 = 9;    // rebuild every connection on a new server connection (a test of rebuilding)
+pub const MOVED: u8 = 10;
 const HEADER: usize = 10; // kind u8, connection u32, payload length u32, number of fds u8
 
 pub struct Frame {
