@@ -2,13 +2,17 @@
 import re
 import time
 
-import gi
+try:
+    import gi
 
-gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi, GLib  # noqa: E402
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, GLib
+except (ImportError, ValueError):  # no AT-SPI here (another platform, or a minimal install): no UI state
+    Atspi = GLib = None
 
-Atspi.set_timeout(1500, 1500)
-S = Atspi.StateType
+if Atspi:
+    Atspi.set_timeout(1500, 1500)
+S = Atspi.StateType if Atspi else None
 TOGGLE_ROLES = {"toggle button", "radio button", "check box", "push button"}
 VALUE_ROLES = {"scroll bar", "slider", "spin button"}
 TEXT_ROLES = {"entry", "spin button"}
@@ -17,6 +21,8 @@ SKIP_TOGGLE = re.compile(r"menu|close|minimi|maximi|search|show open tabs", re.I
 
 def frame(pid, title):
     """The AT-SPI frame of a window: same pid, best title match."""
+    if Atspi is None:
+        return None
     try:
         desk = Atspi.get_desktop(0)
         best = None

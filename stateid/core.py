@@ -7,12 +7,11 @@ import threading
 import time
 from datetime import datetime
 
-from . import __version__, a11y, freeze, privacy, store
+from . import __version__, a11y, desktops, freeze, privacy, store
 from .adapters import adapter_for
 from .adapters.terminal import resume_argv
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, launch_argv, read_proc,
                     spawn, user_files)
-from .shell import Shell
 
 WINDOW_WAIT = 30  # seconds to wait for a relaunched app's window
 # AT-SPI and the D-Bus proxy are not meant for concurrent use; the MCP server runs tools in threads.
@@ -33,7 +32,7 @@ def list_windows():
     """Windows open right now, as an agent may see them (private and excluded titles hidden)."""
     cfg = privacy.load()
     with _lock:
-        return [_summary(w, cfg) for w in Shell().windows()]
+        return [_summary(w, cfg) for w in desktops.current().windows()]
 
 
 def is_private(st, cfg):
@@ -168,7 +167,7 @@ def save(window=None, focused=False, copy=False, screenshots=True):
     cfg = privacy.load()
     p = cfg["privacy"]
     with _lock:
-        shell = Shell()
+        shell = desktops.current()
         wins = shell.windows()
         for w in wins:
             w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
@@ -201,7 +200,8 @@ def save(window=None, focused=False, copy=False, screenshots=True):
         scope = "window" if window is not None or focused else "desktop"
         excluded_apps = [w["app_name"] or w["wm_class"] for w in excluded]
         (d / "state.json").write_text(json.dumps(
-            {"id": kid, "version": __version__, "created": created, "scope": scope, "excluded": excluded_apps,
+            {"id": kid, "version": __version__, "created": created, "scope": scope, "desktop": shell.name,
+             "excluded": excluded_apps,
              "windows": states}, ensure_ascii=False, indent=1))
         views = [agent_view(st, cfg) for st in states]
         (d / "AGENT.md").write_text(store.agent_md(kid, views, created, excluded_apps))
@@ -263,7 +263,7 @@ def restore(kid):
     """Bring a saved moment back. Returns a per-window report."""
     data = store.load(kid)
     with _lock:
-        shell = Shell()
+        shell = desktops.current()
         current = shell.windows()
         known = {c["seq"] for c in current}
         used = set()

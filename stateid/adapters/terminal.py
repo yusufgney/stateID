@@ -12,7 +12,7 @@ import time
 
 from .. import a11y
 from ..procs import HOME, cmdline, descendants, foreground, read_proc, spawn, tty_of
-from ..shell import Shell
+from .. import desktops
 from .base import Adapter
 
 SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -141,7 +141,7 @@ class Terminal(Adapter):
             return ["ptyxis", "--new-window" if first else "--tab", "-d", d] + (["--", *c] if c else [])
 
         try:
-            shell = Shell()
+            shell = desktops.current()
             before = {w["seq"] for w in shell.windows()}
         except Exception:
             shell = None

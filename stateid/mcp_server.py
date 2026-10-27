@@ -10,7 +10,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import __version__, core, privacy, store
-from .shell import ShellUnavailable
+from .desktops import DesktopUnavailable
 
 INSTRUCTIONS = """\
 stateid captures the user's GNOME desktop as a short state ID such as DK-7SZKSJV0: the open
@@ -34,7 +34,7 @@ def expected_errors():
     """Errors the model should see and can act on (unknown ID, extension not loaded, no such window)."""
     try:
         yield
-    except (store.StateNotFound, ShellUnavailable, LookupError, privacy.ConfigError) as e:
+    except (store.StateNotFound, DesktopUnavailable, LookupError, privacy.ConfigError) as e:
         raise ToolError(str(e)) from e
 
 

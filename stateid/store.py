@@ -3,13 +3,11 @@ import json
 import os
 import re
 import secrets
+import io
 import shutil
 from pathlib import Path
 
-import gi
-
-gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import GdkPixbuf, GLib  # noqa: E402
+from PIL import Image
 
 from . import privacy
 
@@ -85,20 +83,21 @@ def screenshot(kid, name, max_width=1280, quality=80):
     f = path(kid) / name
     if not re.fullmatch(r"window\d+\.png", name) or not f.exists():
         return None
-    pb = GdkPixbuf.Pixbuf.new_from_file(str(f))
-    if pb.get_width() > max_width:
-        pb = pb.scale_simple(max_width, round(pb.get_height() * max_width / pb.get_width()),
-                             GdkPixbuf.InterpType.BILINEAR)
-    if pb.get_has_alpha():  # JPEG has no alpha; flatten onto white
-        flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, pb.get_width(), pb.get_height())
-        flat.fill(0xFFFFFFFF)
-        pb.composite(flat, 0, 0, pb.get_width(), pb.get_height(), 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
-        pb = flat
     try:
-        ok, data = pb.save_to_bufferv("jpeg", ["quality"], [str(quality)])
-    except GLib.Error:
+        with Image.open(f) as im:
+            im.load()
+            if im.width > max_width:
+                im = im.resize((max_width, round(im.height * max_width / im.width)), Image.Resampling.BILINEAR)
+            if im.mode in ("RGBA", "LA", "P"):  # JPEG has no alpha; flatten onto white
+                im = im.convert("RGBA")
+                flat = Image.new("RGB", im.size, "white")
+                flat.paste(im, mask=im.getchannel("A"))
+                im = flat
+            out = io.BytesIO()
+            im.convert("RGB").save(out, "JPEG", quality=quality)
+    except OSError:
         return None
-    return bytes(data) if ok else None
+    return out.getvalue()
 
 
 def agent_md(kid, states, created, excluded=()):

@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 authors = [{ name = "yusufgney" }]
 # PyGObject (gi) with Gio, Atspi and GdkPixbuf comes from the system: python3-gi, gir1.2-atspi-2.0,
 # gir1.2-gdkpixbuf-2.0. install.sh creates a virtualenv with --system-site-packages for that reason.
-dependencies = ["mcp>=2.3,<3", "websockets>=12"]
+dependencies = ["mcp>=2.3,<3", "websockets>=12", "pillow>=10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

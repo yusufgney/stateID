@@ -5,7 +5,7 @@ import os
 import sys
 
 from . import __version__, core, freeze, privacy, store
-from .shell import ShellUnavailable
+from .desktops import DesktopUnavailable
 
 DESCRIPTION = """\
 stateid gives the current state of your open windows a short ID (like DK-7SZKSJV0)
@@ -218,7 +218,7 @@ def main():
         return
     try:
         args.fn(args)
-    except (ShellUnavailable, store.StateNotFound, LookupError, privacy.ConfigError,
+    except (DesktopUnavailable, store.StateNotFound, LookupError, privacy.ConfigError,
             freeze.HelperUnavailable, freeze.HelperError) as e:
         sys.exit(str(e))
 

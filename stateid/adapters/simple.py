@@ -6,11 +6,6 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-import gi
-
-gi.require_version("Gio", "2.0")
-from gi.repository import Gio, GLib  # noqa: E402
-
 from ..procs import HOME
 from .base import Adapter
 
@@ -19,6 +14,12 @@ class Nautilus(Adapter):
     pattern = re.compile(r"nautilus", re.I)
 
     def capture(self, w, st):
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError):
+            return
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION)
             r = bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",

@@ -1,4 +1,5 @@
-"""Talk to the stateid GNOME Shell extension over D-Bus (window list, screenshots, placement, clipboard)."""
+"""GNOME backend: talks to the stateid GNOME Shell extension over D-Bus (window list, screenshots,
+placement, clipboard). Only GNOME Shell can do these things on Wayland."""
 import json
 
 import gi
@@ -6,15 +7,15 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+from .base import Desktop, DesktopUnavailable  # noqa: E402
+
 DBUS_PATH, DBUS_IFACE = "/io/github/yusufgney/StateId", "io.github.yusufgney.StateId"
 EXTENSION_UUID = "stateid@yusufgney.github.io"
 
 
-class ShellUnavailable(RuntimeError):
-    pass
+class GnomeShell(Desktop):
+    name = "gnome"
 
-
-class Shell:
     def __init__(self):
         self.proxy = Gio.DBusProxy.new_for_bus_sync(
             Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
@@ -25,7 +26,7 @@ class Shell:
         try:
             res = self.proxy.call_sync(method, params, Gio.DBusCallFlags.NONE, 10000, None)
         except GLib.Error as e:
-            raise ShellUnavailable(
+            raise DesktopUnavailable(
                 "Cannot reach the GNOME Shell extension. Is it enabled?\n"
                 f"  gnome-extensions info {EXTENSION_UUID}\n"
                 "(A newly installed extension loads after you log out and back in.)\n" + e.message) from None
@@ -40,7 +41,8 @@ class Shell:
     def activate(self, seq):
         return self.call("Activate", "(u)", seq)
 
-    def move_resize(self, seq, r, maximize):
+    def move_resize(self, seq, rect, maximize):
+        r = rect
         return self.call("MoveResize", "(uiiiib)", seq, r["x"], r["y"], r["width"], r["height"], maximize)
 
     def copy(self, text):

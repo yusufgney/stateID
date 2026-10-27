@@ -1,4 +1,5 @@
 """Process inspection, document discovery and launching."""
+import configparser
 import glob
 import os
 import re
@@ -8,10 +9,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-import gi
-
-gi.require_version("GLib", "2.0")
-from gi.repository import GLib  # noqa: E402
 
 HOME = Path.home()
 
@@ -179,6 +176,22 @@ def _desktop_entries():
             continue
 
 
+def read_desktop(path):
+    """{group: {key: value}} of a freedesktop .desktop file; {} if it cannot be read."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",), comment_prefixes=("#",))
+    cp.optionxform = str  # keys are case-sensitive
+    try:
+        cp.read(path, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError):
+        return {}
+    return {g: {k: _unescape(v) for k, v in cp[g].items()} for g in cp.sections()}
+
+
+def _unescape(value):
+    """The escapes of the Desktop Entry spec: \\s \\n \\t \\r \\\\."""
+    return re.sub(r"\\(.)", lambda m: {"s": " ", "n": "\n", "t": "\t", "r": "\r"}.get(m[1], m[1]), value)
+
+
 def find_desktop(app_id, wm_class=None):
     """The .desktop file for an app id, or, when the window has no app id (e.g. AppImages show up
     as "window:N"), the one whose StartupWMClass or program name matches the window class."""
@@ -191,14 +204,12 @@ def find_desktop(app_id, wm_class=None):
     want = wm_class.lower()
     by_exec = None
     for path in _desktop_entries():
-        kf = GLib.KeyFile()
+        entry = read_desktop(path).get("Desktop Entry", {})
+        if entry.get("StartupWMClass", "").lower() == want and want:
+            return str(path)
         try:
-            kf.load_from_file(str(path), GLib.KeyFileFlags.NONE)
-            keys = kf.get_keys("Desktop Entry")[0]
-            if "StartupWMClass" in keys and kf.get_string("Desktop Entry", "StartupWMClass").lower() == want:
-                return str(path)
-            prog = os.path.basename(shlex.split(kf.get_string("Desktop Entry", "Exec"))[0]).lower()
-        except (GLib.Error, ValueError, IndexError):
+            prog = os.path.basename(shlex.split(entry["Exec"])[0]).lower()
+        except (KeyError, ValueError, IndexError):
             continue
         if by_exec is None and (prog == want or prog.split(".")[0] == want):
             by_exec = str(path)
@@ -214,17 +225,15 @@ def desktop_command(app_id, files, wm_class=None):
     path = find_desktop(app_id, wm_class)
     if not path:
         return None
-    kf = GLib.KeyFile()
-    try:
-        kf.load_from_file(path, GLib.KeyFileFlags.NONE)
-        exec_ = kf.get_string("Desktop Entry", "Exec")
-        if not files:  # prefer an explicit "new window" action when there is nothing to open
-            for group in kf.get_groups()[0]:
-                if group.startswith("Desktop Action") and "new-window" in group.lower():
-                    exec_ = kf.get_string(group, "Exec")
-                    break
-    except GLib.Error:
+    groups = read_desktop(path)
+    exec_ = groups.get("Desktop Entry", {}).get("Exec")
+    if not exec_:
         return None
+    if not files:  # prefer an explicit "new window" action when there is nothing to open
+        for group, keys in groups.items():
+            if group.startswith("Desktop Action") and "new-window" in group.lower() and keys.get("Exec"):
+                exec_ = keys["Exec"]
+                break
     cmd = []
     for arg in shlex.split(exec_):
         if arg in ("%U", "%F"):
