@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +91,27 @@ def test_session_env_cannot_point_outside_the_frozen_tree():
         "WAYLAND_DISPLAY": "wayland-0", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus",
         "HOME": "/root", "LANG": "tr_TR.UTF-8"}})
     assert env == {"LANG": "tr_TR.UTF-8"}
+
+
+def test_software_rendering_is_kept_off_udmabuf_when_the_library_is_installed(helper, sleeper, monkeypatch):
+    specs = []
+    monkeypatch.setattr(hd, "spawn_session", lambda uid, spec: specs.append(spec) or sleeper.pid)
+    req = {"op": "start", "argv": ["x"], "env": {"LD_PRELOAD": "mine.so", "VK_ADD_DRIVER_FILES": "gpu.json"}}
+    for installed in (False, True):
+        monkeypatch.setattr(hd, "root_owned", lambda p: installed)
+        helper.handle(UID, req)
+    without, with_ = specs
+    assert not without["glx"] and without["env"]["LD_PRELOAD"] == "mine.so"
+    assert with_["glx"] and with_["env"]["LD_PRELOAD"] == f"{hd.NODEV} mine.so"
+    if os.path.exists(hd.LAVAPIPE_ICD):
+        assert with_["env"]["VK_DRIVER_FILES"] == hd.LAVAPIPE_ICD and "VK_ADD_DRIVER_FILES" not in with_["env"]
+
+
+def test_a_library_the_user_could_change_is_not_preloaded(tmp_path):
+    lib = tmp_path / "stateid_nodev.so"
+    lib.touch()
+    assert not hd.root_owned(lib)
+    assert hd.root_owned("/usr/bin/env")
 
 
 @pytest.mark.parametrize("bad", ["../../etc", "AAAAAAAAAAAA", "short", "", None, 5, "aaaaaaaaaaaa/.."])
@@ -308,3 +330,19 @@ def test_sweep_ends_what_a_killed_helper_left(helper):
     finally:
         left.kill()
         left.wait()
+
+
+def test_nodev_library_refuses_only_udmabuf(tmp_path):
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    lib = tmp_path / "nodev.so"
+    subprocess.run([cc, "-O2", "-shared", "-fPIC", "-o", str(lib), str(Path(hd.__file__).with_name("stateid_nodev.c")),
+                    "-ldl"], check=True)
+    probe = ("import errno, os\n"
+             "for p in ('/dev/udmabuf', '/dev/null'):\n"
+             "    try: os.close(os.open(p, os.O_RDWR)); print(p, 'open')\n"
+             "    except OSError as e: print(p, errno.errorcode[e.errno])\n")
+    out = subprocess.run([sys.executable, "-c", probe], env=dict(os.environ, LD_PRELOAD=str(lib)),
+                         capture_output=True, text=True, check=True).stdout
+    assert out.splitlines() == ["/dev/udmabuf EACCES", "/dev/null open"]

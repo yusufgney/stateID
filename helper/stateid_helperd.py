@@ -72,6 +72,11 @@ SESSION_ENV = {
     "GSETTINGS_BACKEND": "memory", "NO_AT_BRIDGE": "1", "GTK_A11Y": "none",
     "QT_LINUX_ACCESSIBILITY_ALWAYS_ON": "0", "ELECTRON_DISABLE_GPU": "1",
 }
+# Built by install-helper.sh next to the helper (stateid_nodev.c): keeps the session's programs from
+# opening /dev/udmabuf, which Mesa's software rendering opens and CRIU cannot freeze. With it the
+# session has GLX, and Vulkan programs draw in software (lavapipe) instead of on a device.
+NODEV = Path(__file__).resolve().with_name("stateid_nodev.so")
+LAVAPIPE_ICD = "/usr/share/vulkan/icd.d/lvp_icd.json"
 DBUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
@@ -230,6 +235,15 @@ def validate_start(req):
     return argv, cwd, {k: v for k, v in env.items() if k not in ENV_DROP}, geometry
 
 
+def root_owned(path):
+    """True if `path` and its directory belong to root and nobody else may change them."""
+    try:
+        return all((st := os.stat(p)).st_uid == 0 and not st.st_mode & 0o022
+                   for p in (path, os.path.dirname(path)))
+    except OSError:
+        return False
+
+
 def valid_id(value, what):
     if not (isinstance(value, str) and ID_RE.match(value)):
         raise Refused(f"invalid {what}")
@@ -377,12 +391,18 @@ class Helper:
         os.chmod(rdir / "dbus.conf", 0o644)  # read by the session, which runs as the user
         user = pwd.getpwuid(uid)
         env.update(SESSION_ENV)
+        nodev = root_owned(NODEV)
+        if nodev:
+            env["LD_PRELOAD"] = " ".join(filter(None, [str(NODEV), env.get("LD_PRELOAD")]))
+            if os.path.exists(LAVAPIPE_ICD):
+                env["VK_DRIVER_FILES"] = env["VK_ICD_FILENAMES"] = LAVAPIPE_ICD
+                env.pop("VK_ADD_DRIVER_FILES", None)
         env.update({"HOME": user.pw_dir, "USER": user.pw_name, "LOGNAME": user.pw_name,
                     "SHELL": user.pw_shell, "DISPLAY": f":{display}", "XDG_RUNTIME_DIR": str(rdir),
                     "STATEID_SESSION": sid})
         env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
         spec = {"argv": argv, "cwd": cwd or user.pw_dir, "env": env, "display": display,
-                "geometry": geometry, "run_dir": str(rdir)}
+                "geometry": geometry, "run_dir": str(rdir), "glx": nodev}
         pid = spawn_session(uid, spec)
         s = {"sid": sid, "uid": uid, "pid": pid, "start_time": start_time(pid), "display": display,
              "argv": argv, "run_dir": str(rdir), "vnc_socket": str(rdir / "vnc.sock"),
@@ -588,16 +608,16 @@ def session_init(spec):
     sid = spec["env"]["STATEID_SESSION"]
     # every process of the session carries its id, so nothing is left behind when it ends
     base_env = {"PATH": "/usr/bin:/bin", "HOME": spec["env"]["HOME"], "STATEID_SESSION": sid}
-    # a program on stateid-vgpu's relay (`stateid run --gpu`) draws through it, with no device and no
-    # /dev/udmabuf even over GLX, so GLX stays on for it
+    # without a GPU: an open /dev/dri render node cannot be checkpointed, and a Mesa context opens
+    # /dev/udmabuf, so GLX is off unless stateid_nodev keeps it from that, or the program draws through
+    # stateid-vgpu's relay (`stateid run --gpu`), which opens neither
     relay = os.path.basename(spec["argv"][0]).startswith("stateid-vgpu") and spec["argv"][1:2] == ["proxy"]
+    glx = spec.get("glx") or relay
     xvnc = subprocess.Popen(
         [XVNC, f":{display}", "-geometry", spec["geometry"], "-depth", "24", "-rfbport", "-1",
          "-rfbunixpath", f"{rdir}/vnc.sock", "-rfbunixmode", "0600", "-SecurityTypes", "None",
          "-AlwaysShared", "-AcceptSetDesktopSize", "-nolisten", "tcp", "-extension", "MIT-SHM",
-         # no GPU: an open /dev/dri render node cannot be checkpointed, and without GLX no program
-         # creates a Mesa context (which opens /dev/udmabuf)
-         "-rendernode", "none", *([] if relay else ["-extension", "GLX"]),
+         "-rendernode", "none", *([] if glx else ["-extension", "GLX"]),
          "-desktop", f"{os.path.basename(spec['argv'][0])} (stateid {os.path.basename(rdir)})"],
         stdin=subprocess.DEVNULL, env=base_env)
     for _ in range(200):
