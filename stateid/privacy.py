@@ -26,7 +26,7 @@ DEFAULTS = {
         # browser tabs whose title or URL matches are hidden from agents
         "private_tabs": [],
         "screenshots": True,          # take window screenshots at all
-        "agent_screenshots": True,    # let get_state send screenshots to the model
+        "agent_screenshots": False,   # let get_state send screenshots to the model (off: they go to a cloud model)
         "terminal_text": True,        # keep the text on terminal screens
         "redact": True,               # mask secrets in everything an agent reads
     },
@@ -52,7 +52,7 @@ private = []            # e.g. ["whatsapp", "*bank*", "telegram", "mail"]
 private_tabs = []       # e.g. ["web.whatsapp.com", "*bank*", "mail.google.com"]
 
 screenshots = true        # take window screenshots at all
-agent_screenshots = true  # let agents (MCP get_state) receive screenshots
+agent_screenshots = false  # let agents (MCP get_state) receive screenshots; they may reach a cloud model
 terminal_text = true      # keep the text on terminal screens
 redact = true             # mask passwords, tokens and keys in what agents read
 

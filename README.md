@@ -17,7 +17,7 @@ claude mcp add --scope user stateid -- ~/.local/bin/stateid-mcp
 Then just talk to the agent:
 
 - *"Save my desktop"*: the agent takes a snapshot and gets an ID.
-- *"Continue from DK-7SZKSJV0"*: the agent reads what was open, where you were and the screenshots, then picks up the work.
+- *"Continue from DK-7SZKSJV0"*: the agent reads what was open and where you were, then picks up the work.
 - *"What did I do since DK-7SZKSJV0?"*: the agent compares that moment with the desktop now.
 - *"What am I working on?"*: the agent lists the windows open right now.
 - *"Restore DK-7SZKSJV0"*: the agent reopens and arranges everything.
@@ -26,7 +26,7 @@ Then just talk to the agent:
 |---|---|
 | `list_windows` | The windows open right now |
 | `save_state` | Snapshot the desktop or one window; returns an ID |
-| `get_state` | A state's summary plus window screenshots |
+| `get_state` | A state's summary, plus window screenshots if you allow them |
 | `diff_states` | What changed since a state, or between two states |
 | `list_states` | Saved states, newest first |
 | `restore_state` | Bring a state back on screen (only when you ask) |
@@ -66,7 +66,7 @@ stateid config [--init]     privacy settings
 
 ## Privacy
 
-Agents see only what your settings allow. In `~/.config/stateid/config.toml` you can exclude apps, hide windows or tabs from agents, keep screenshots away from them, and mask secrets such as tokens and passwords. States are stored in your home folder, readable only by you.
+Agents see only what your settings allow. Screenshots are not sent to agents unless you turn on `agent_screenshots`. In `~/.config/stateid/config.toml` you can exclude apps, hide windows or tabs from agents, and mask secrets such as tokens and passwords. States are stored in your home folder, readable only by you.
 
 ## Development
 

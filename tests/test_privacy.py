@@ -174,8 +174,10 @@ def test_terminal_text_can_be_turned_off(saved):
 
 def test_private_windows_get_no_screenshots(saved, monkeypatch):
     monkeypatch.setattr(store, "screenshot", lambda kid, name, max_width=1280: b"jpeg")
+    assert core.screenshots(saved) == []  # off by default
+    write_config('[privacy]\nagent_screenshots = true\n')
     assert [n for n, *_ in core.screenshots(saved)] == [1, 2]
-    write_config('[privacy]\nprivate = ["whatsapp"]\n')
+    write_config('[privacy]\nagent_screenshots = true\nprivate = ["whatsapp"]\n')
     assert [n for n, *_ in core.screenshots(saved)] == [2]
     write_config('[privacy]\nagent_screenshots = false\n')
     assert core.screenshots(saved) == []
