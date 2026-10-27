@@ -1,0 +1,11 @@
+[package]
+name = "stateid-vgpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "GPU relay for stateid's freezable sessions (proxy inside the session, keeper outside)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

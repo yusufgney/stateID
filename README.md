@@ -66,7 +66,7 @@ stateid config [--init]     privacy settings
 
 - **Any app:** windows, position and workspace, open documents, working directory, text cursor and a screenshot.
 - **Deeper app state:** OnlyOffice (slide, pen, slideshow), Chromium browsers (tabs), terminals (directories, resumed Claude Code sessions), Nautilus, Evince and VS Code. More apps, other Linux desktops and Windows 11 are planned.
-- **Unsaved work (experimental):** a program started with `stateid run` has its whole memory frozen with [CRIU](https://criu.org) when you save, so unsaved changes come back on restore. Such programs draw without the GPU; `stateid run --gpu` lets OpenGL programs use it through [virgl](https://docs.mesa3d.org/drivers/virgl.html) (tried with Intel and NVIDIA): the session can be frozen, but restoring it is not supported yet.
+- **Unsaved work (experimental):** a program started with `stateid run` has its whole memory frozen with [CRIU](https://criu.org) when you save, so unsaved changes come back on restore. Such programs draw without the GPU; `stateid run --gpu` lets OpenGL programs use it through [virgl](https://docs.mesa3d.org/drivers/virgl.html) (tried with Intel and NVIDIA); its relay is built with `cargo` on first use: the session can be frozen, but restoring it is not supported yet.
 
 ## Privacy
 

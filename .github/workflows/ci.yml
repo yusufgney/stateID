@@ -38,6 +38,9 @@ jobs:
       - name: Tests
         run: .venv/bin/python -m pytest -q
 
+      - name: Rust tests (stateid-vgpu)
+        run: cargo test --quiet --manifest-path stateid/vgpu_rs/Cargo.toml
+
       # only the project's own dependencies (pyproject.toml), not the distribution's packages
       - name: Audit dependencies
         run: .venv/bin/pip-audit .

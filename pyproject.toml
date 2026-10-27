@@ -28,7 +28,7 @@ stateid-mcp = "stateid.mcp_server:main"
 packages = ["stateid", "stateid.adapters"]
 
 [tool.setuptools.package-data]
-stateid = ["*.c"]
+stateid = ["*.c", "vgpu_rs/Cargo.toml", "vgpu_rs/Cargo.lock", "vgpu_rs/src/*.rs"]
 
 [tool.setuptools.dynamic]
 version = { attr = "stateid.__version__" }
