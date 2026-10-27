@@ -220,6 +220,51 @@ def test_restore_registers_the_new_session(helper, sleeper):
         other.kill()
 
 
+def test_restore_puts_back_the_run_dir_a_reboot_emptied(helper, sleeper, tmp_path):
+    s = register(helper, sleeper.pid)
+    rdir = helper.run_dir(UID, s["sid"])
+    (rdir / "session.log").write_text("what the session wrote\n")
+    os.chmod(rdir / "session.log", 0o600)
+    (rdir / "dbus-abc").mkdir(mode=0o700)
+    secret = tmp_path / "elsewhere"
+    secret.write_text("not for the image")
+    (rdir / "link").symlink_to(secret)
+    os.link(secret, rdir / "second-name")  # a hard link to a file outside
+    meta = helper.handle(UID, {"op": "freeze", "sid": s["sid"]})
+    helper.handle(UID, {"op": "stop", "sid": s["sid"]})
+    assert sleeper.wait(timeout=5) is not None
+    shutil.rmtree(helper.run_base)  # as after a reboot
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        helper.run.restored_pid = other.pid
+        helper.handle(UID, {"op": "restore", "iid": meta["iid"]})
+    finally:
+        other.kill()
+        other.wait()
+    assert (rdir / "session.log").read_text() == "what the session wrote\n"
+    assert (rdir / "session.log").stat().st_mode & 0o777 == 0o600
+    assert (rdir / "dbus-abc").is_dir()
+    assert sorted(p.name for p in rdir.iterdir()) == ["dbus-abc", "session.log"]
+
+
+def test_restore_keeps_what_is_in_the_run_dir(helper, sleeper):
+    s = register(helper, sleeper.pid)
+    rdir = helper.run_dir(UID, s["sid"])
+    (rdir / "session.log").write_text("old\n")
+    meta = helper.handle(UID, {"op": "freeze", "sid": s["sid"]})
+    helper.handle(UID, {"op": "stop", "sid": s["sid"]})
+    assert sleeper.wait(timeout=5) is not None
+    (rdir / "session.log").write_text("old\nnewer\n")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        helper.run.restored_pid = other.pid
+        helper.handle(UID, {"op": "restore", "iid": meta["iid"]})
+    finally:
+        other.kill()
+        other.wait()
+    assert (rdir / "session.log").read_text() == "old\nnewer\n"
+
+
 def test_restore_refuses_a_busy_display(helper, sleeper):
     s = register(helper, sleeper.pid)
     meta = helper.handle(UID, {"op": "freeze", "sid": s["sid"]})

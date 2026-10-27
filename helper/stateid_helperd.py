@@ -30,6 +30,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -254,6 +255,107 @@ def new_id():
     return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12))
 
 
+# What of a session's runtime directory is kept with its image, for a restore after it is gone (a
+# reboot empties /run): its directories, and its small regular files (session.log, dbus.conf, ...)
+RUN_COPY_ENTRIES = 256
+RUN_COPY_FILE = 4 << 20
+RUN_COPY_TOTAL = 16 << 20
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def save_run_dir(rdir, dest, uid):
+    """Copy what the image needs of `rdir` into `dest`; returns its listing. The directory is the
+    user's, so nothing is followed: only directories, and regular files of the user (or root's, which
+    only the helper puts there) with one link."""
+    listing, total = [], 0
+
+    def walk(dfd, rel, depth):
+        nonlocal total
+        for e in sorted(os.scandir(dfd), key=lambda e: e.name):
+            path = f"{rel}{e.name}"
+            if len(listing) >= RUN_COPY_ENTRIES or not NAME_RE.match(e.name) or e.name in (".", ".."):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode) and depth < 4 and st.st_uid == uid:
+                listing.append({"path": path, "dir": True, "mode": st.st_mode & 0o777})
+                sub = os.open(e.name, DIR_FLAGS, dir_fd=dfd)
+                try:
+                    walk(sub, path + "/", depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(st.st_mode):
+                try:
+                    fd = os.open(e.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+                except OSError:
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid in (uid, 0)):
+                        continue
+                    entry = {"path": path, "dir": False, "mode": st.st_mode & 0o777, "root": st.st_uid == 0,
+                             "copy": None}
+                    if st.st_size <= RUN_COPY_FILE and total + st.st_size <= RUN_COPY_TOTAL:
+                        data = os.read(fd, RUN_COPY_FILE + 1)[:RUN_COPY_FILE]
+                        entry["copy"] = str(len(listing))
+                        (dest / entry["copy"]).write_bytes(data)
+                        total += len(data)
+                    listing.append(entry)  # else it comes back empty
+                finally:
+                    os.close(fd)
+
+    dest.mkdir(mode=0o700)
+    top = os.open(rdir, DIR_FLAGS)
+    try:
+        walk(top, "", 0)
+    finally:
+        os.close(top)
+    return listing
+
+
+def rebuild_run_dir(rdir, src, listing, uid, gid):
+    """Put back what of `rdir` is missing, from save_run_dir's copy; what is there stays."""
+    top = os.open(rdir, DIR_FLAGS)
+    try:
+        for entry in listing:
+            parts = str(entry.get("path", "")).split("/")
+            if not all(NAME_RE.match(p) and p not in (".", "..") for p in parts) or len(parts) > 5:
+                continue
+            dfd, opened = top, []
+            try:
+                for part in parts[:-1]:
+                    dfd = os.open(part, DIR_FLAGS, dir_fd=dfd)
+                    opened.append(dfd)
+                name, mode = parts[-1], int(entry.get("mode", 0o600)) & 0o777
+                if entry.get("dir"):
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=dfd)
+                    except FileExistsError:
+                        continue
+                    fd = os.open(name, DIR_FLAGS, dir_fd=dfd)
+                else:
+                    try:
+                        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                    except FileExistsError:
+                        continue
+                    copy = entry.get("copy")
+                    if copy and re.match(r"^[0-9]{1,4}$", copy) and (src / copy).is_file():
+                        os.write(fd, (src / copy).read_bytes())
+                try:
+                    if not entry.get("root"):
+                        os.fchown(fd, uid, gid)
+                    os.fchmod(fd, mode)
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue  # e.g. a parent that is not a directory any more
+            finally:
+                for f in opened:
+                    os.close(f)
+    finally:
+        os.close(top)
+
+
 def image_credentials_ok(img_dir, uid):
     """Every uid/gid stored in the image's process cores must be the caller's.
     (Images are root-only already; this is a second line of defence.)"""
@@ -435,10 +537,15 @@ class Helper:
             tail = log_tail(d / "dump.log")
             shutil.rmtree(d, ignore_errors=True)
             raise Refused("freeze failed: " + tail)
+        seconds = round(time.time() - t0, 3)
+        try:
+            run_files = save_run_dir(s["run_dir"], d / "run_dir", uid)
+        except OSError:
+            run_files = []
         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
         meta = {"iid": iid, "uid": uid, "sid": s["sid"], "argv": s["argv"], "display": s["display"],
-                "run_dir": s["run_dir"], "created": time.time(), "bytes": size,
-                "seconds": round(time.time() - t0, 3)}
+                "run_dir": s["run_dir"], "run_files": run_files, "created": time.time(), "bytes": size,
+                "seconds": seconds}
         (d / "meta.json").write_text(json.dumps(meta))
         if not req.get("leave_running", True):
             self.forget(uid, s)
@@ -464,6 +571,7 @@ class Helper:
         if rdir.parent.parent != self.run_base or rdir.parent.name != str(uid):
             raise Refused("image refers to an unexpected runtime directory")
         self.run_dir(uid, rdir.name)
+        rebuild_run_dir(rdir, d / "run_dir", meta.get("run_files") or [], uid, pwd.getpwuid(uid).pw_gid)
         for sock in rdir.glob("*.sock"):
             sock.unlink(missing_ok=True)
         pidfile = d / "restored.pid"
