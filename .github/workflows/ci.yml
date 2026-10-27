@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # PyGObject (gi) with Atspi and GdkPixbuf comes from the distribution, as in install.sh
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi python3-venv \
+            gir1.2-atspi-2.0 gir1.2-gdkpixbuf-2.0 shellcheck
+
+      - name: Create the environment
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install -q -e ".[dev]" ruff pip-audit
+
+      - name: Lint (errors only)
+        run: .venv/bin/ruff check --select E9,F63,F7,F82 stateid helper tests
+
+      - name: Check scripts and the extension
+        run: |
+          bash -n install.sh uninstall.sh helper/install-helper.sh
+          shellcheck --severity=error install.sh uninstall.sh helper/install-helper.sh
+          node --check extension/*/extension.js
+
+      - name: Tests
+        run: .venv/bin/python -m pytest -q
+
+      # only the project's own dependencies (pyproject.toml), not the distribution's packages
+      - name: Audit dependencies
+        run: .venv/bin/pip-audit .
+
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
