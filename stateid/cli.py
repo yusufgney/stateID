@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-from . import __version__, core, freeze, privacy, store
+from . import __version__, autosave, core, freeze, privacy, store
 from .desktops import DesktopUnavailable
 
 DESCRIPTION = """\
@@ -39,6 +39,7 @@ examples:
   stateid list                    find an ID
   stateid DK-7SZKSJV0             go back to that moment
   stateid show DK-7SZKSJV0        what an agent should read to continue
+  stateid autosave --enable       save automatically whenever the windows change
 
 privacy: password managers and private/incognito windows are never captured;
   `stateid config --init` writes ~/.config/stateid/config.toml where you can
@@ -95,7 +96,8 @@ def cmd_list(args):
         print("No saved states yet. Create one with `stateid save`.")
     for r in rows:
         names = ", ".join(f"{w['app']}: {w['title']}"[:60] for w in r["windows"][:2])
-        print(f"{r['id']}  {r['created'].replace('T', ' ')}  {len(r['windows']):>2} window(s)  {names}")
+        auto = "auto" if r.get("auto") else "    "
+        print(f"{r['id']}  {r['created'].replace('T', ' ')}  {auto}  {len(r['windows']):>2} window(s)  {names}")
 
 
 def cmd_delete(args):
@@ -113,6 +115,26 @@ def cmd_config(args):
     exists = privacy.CONFIG_PATH.exists()
     print(f"# {privacy.CONFIG_PATH}" + ("" if exists else " (not created yet: defaults below; `stateid config --init`)"))
     print(json.dumps(privacy.load(), indent=2))
+
+
+def cmd_autosave(args):
+    if args.enable:
+        autosave.enable(os.path.abspath(sys.argv[0]))
+        minutes = privacy.load()["autosave"]["interval_minutes"]
+        print(f"automatic saves on: every {minutes} min when the windows changed "
+              f"(settings: [autosave] in {privacy.CONFIG_PATH})")
+    elif args.disable:
+        autosave.disable()
+        print("automatic saves off (automatic states already saved are kept)")
+    elif args.status:
+        st = autosave.status()
+        print(f"service: {st['service']}; {st['automatic_states']} automatic state(s)"
+              + (f", latest {st['latest']['id']} at {st['latest']['created'].replace('T', ' ')}" if st["latest"] else ""))
+    elif args.watch:
+        autosave.watch()
+    else:
+        r = autosave.once()
+        print(r["id"] if r else "nothing changed since the last automatic state; not saved")
 
 
 def cmd_run(args):
@@ -196,6 +218,19 @@ def build_parser():
     s.add_argument("id", nargs="+", help="state IDs")
     s.set_defaults(fn=cmd_delete)
 
+    s = sub.add_parser("autosave", help="save the desktop automatically when it changes (off by default)",
+                       description="Without options: save the whole desktop now, but only if the windows changed "
+                                   "since the last automatic state. --enable runs that every [autosave] "
+                                   "interval_minutes (default 15) as a systemd user service. Automatic states are "
+                                   "marked `auto` in `stateid list`; only the newest [autosave] keep (default 24) "
+                                   "are kept. They do not freeze `stateid run` sessions.")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--enable", action="store_true", help="start automatic saves now and at every login")
+    g.add_argument("--disable", action="store_true", help="stop automatic saves")
+    g.add_argument("--status", action="store_true", help="show whether automatic saves are on")
+    g.add_argument("--watch", action="store_true", help="keep saving in the foreground (what the service runs)")
+    s.set_defaults(fn=cmd_autosave)
+
     s = sub.add_parser("run", help="start a program whose memory can be saved (unsaved work included)",
                        description="Start PROGRAM in a freezable session: it runs on its own virtual display "
                                    "and is shown in a viewer window. `stateid save` then freezes its whole "
@@ -231,7 +266,7 @@ def main():
     try:
         args.fn(args)
     except (DesktopUnavailable, store.StateNotFound, LookupError, privacy.ConfigError,
-            freeze.HelperUnavailable, freeze.HelperError) as e:
+            freeze.HelperUnavailable, freeze.HelperError, autosave.ServiceError) as e:
         sys.exit(str(e))
 
 

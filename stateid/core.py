@@ -91,11 +91,7 @@ def diff(old_id, new_id=None):
             for w in wins:
                 w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
             wins = [w for w in wins if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
-            states = []
-            for w in wins:
-                st = describe_window(w)
-                _apply_privacy(st, cfg)
-                states.append(st)
+            states = _describe_all(wins, cfg)
         new_views, created = [agent_view(st, cfg) for st in states], datetime.now().isoformat(timespec="seconds")
     return diffs.report(old["id"], old["created"], old_views, new_id and store.normalize(new_id), created, new_views)
 
@@ -120,6 +116,25 @@ def prune(keep_days):
         except (ValueError, store.StateNotFound):
             continue
     return gone
+
+
+def prune_auto(keep):
+    """Keep only the newest `keep` automatic states; states saved by hand are never touched."""
+    autos = [r for r in store.list_states(limit=None) if r.get("auto")]
+    gone = []
+    for row in autos[max(0, keep):]:
+        try:
+            gone.append(store.delete(row["id"]))
+        except store.StateNotFound:
+            continue
+    return gone
+
+
+def unchanged(old, states, cfg):
+    """True when the windows read now show nothing new against a saved state (as diff_states sees it)."""
+    old_views = [agent_view(st, cfg) for st in old["windows"]]
+    pairs, opened, closed = diffs.match(old_views, [agent_view(st, cfg) for st in states])
+    return not (opened or closed or any(diffs.changes(a, b) for a, b in pairs))
 
 
 def describe_window(w):
@@ -149,6 +164,15 @@ def describe_window(w):
     except Exception as e:  # an adapter failing must not lose the snapshot
         st["app_state"] = {"error": f"{type(e).__name__}: {e}"}
     return st
+
+
+def _describe_all(wins, cfg):
+    states = []
+    for w in wins:
+        st = describe_window(w)
+        _apply_privacy(st, cfg)
+        states.append(st)
+    return states
 
 
 def _apply_privacy(st, cfg):
@@ -186,9 +210,12 @@ def freeze_sessions(states):
             a["freeze_error"] = str(e)
 
 
-def save(window=None, focused=False, copy=False, screenshots=True):
+def save(window=None, focused=False, copy=False, screenshots=True, auto=False):
     """Snapshot windows (all, one by sequence number, or the focused one). Returns the new state's summary,
-    already filtered for agents."""
+    already filtered for agents.
+
+    auto: an automatic save of the whole desktop. It is skipped (returns None) when nothing changed since
+    the last automatic state, does not freeze `stateid run` sessions and is pruned by [autosave] keep."""
     cfg = privacy.load()
     p = cfg["privacy"]
     with _lock:
@@ -207,26 +234,28 @@ def save(window=None, focused=False, copy=False, screenshots=True):
         if not wins:
             raise LookupError("Every matching window is excluded by the privacy settings "
                               f"({privacy.CONFIG_PATH})")
+        states = _describe_all(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"])), cfg)
+        if auto:
+            last = next((r for r in store.list_states(limit=None) if r.get("auto")), None)
+            if last and unchanged(store.load(last["id"]), states, cfg):
+                return None
         kid = store.new_id()
         store.STORE.mkdir(parents=True, exist_ok=True)
         os.chmod(store.STORE, 0o700)
         d = store.STORE / kid
         d.mkdir(mode=0o700)
-        states = []
-        for i, w in enumerate(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"]))):
-            st = describe_window(w)
-            _apply_privacy(st, cfg)
+        for i, st in enumerate(states):
             png = f"window{i + 1}.png"
-            if screenshots and p["screenshots"] and shell.capture(w["seq"], d / png):
+            if screenshots and p["screenshots"] and shell.capture(st["window"]["seq"], d / png):
                 st["screenshot"] = png
-            states.append(st)
-        freeze_sessions(states)
+        if not auto:
+            freeze_sessions(states)
         created = datetime.now().isoformat(timespec="seconds")
         scope = "window" if window is not None or focused else "desktop"
         excluded_apps = [w["app_name"] or w["wm_class"] for w in excluded]
         (d / "state.json").write_text(json.dumps(
             {"id": kid, "version": __version__, "created": created, "scope": scope, "desktop": shell.name,
-             "excluded": excluded_apps,
+             "auto": auto, "excluded": excluded_apps,
              "windows": states}, ensure_ascii=False, indent=1))
         views = [agent_view(st, cfg) for st in states]
         (d / "AGENT.md").write_text(store.agent_md(kid, views, created, excluded_apps,
@@ -236,8 +265,8 @@ def save(window=None, focused=False, copy=False, screenshots=True):
             shell.copy(kid)
             names = ", ".join(s["app"] or "?" for s in states[:3]) + ("…" if len(states) > 3 else "")
             shell.notify(f"State ID copied: {kid}", f"{len(states)} window(s): {names}")
-    pruned = prune(cfg["storage"]["keep_days"])
-    return {"id": kid, "created": created, "scope": scope, "excluded_windows": len(excluded_apps),
+    pruned = prune(cfg["storage"]["keep_days"]) + (prune_auto(cfg["autosave"]["keep"]) if auto else [])
+    return {"id": kid, "created": created, "scope": scope, "auto": auto, "excluded_windows": len(excluded_apps),
             "pruned_old_states": len(pruned),
             "windows": [{"app": v["app"], "private": True} if v.get("private") else
                         {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5]} for v in views]}

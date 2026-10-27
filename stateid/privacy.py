@@ -33,6 +33,10 @@ DEFAULTS = {
     "storage": {
         "keep_days": 0,               # delete states older than this on every save; 0 keeps them forever
     },
+    "autosave": {
+        "interval_minutes": 15,       # how often `stateid autosave --watch` saves (only when something changed)
+        "keep": 24,                   # automatic states kept; older automatic ones are deleted
+    },
 }
 
 TEMPLATE = """\
@@ -58,6 +62,12 @@ redact = true             # mask passwords, tokens and keys in what agents read
 
 [storage]
 keep_days = 0           # delete states older than this many days on each save; 0 = never
+
+[autosave]
+# Off until you run `stateid autosave --enable`. A state is saved only when the
+# windows changed since the last automatic one; states saved by hand are never pruned.
+interval_minutes = 15
+keep = 24               # automatic states kept
 """
 
 

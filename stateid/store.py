@@ -58,9 +58,13 @@ def list_states(limit=20):
         except Exception:
             continue
         rows.append({"id": d["id"], "created": d["created"], "scope": d.get("scope", "desktop"),
+                     "auto": bool(d.get("auto")),
                      "windows": [{"app": s["app"], "private": True} if hidden(s) else
-                                 {"app": s["app"], "title": privacy.redact(s["window"]["title"])} for s in d["windows"]]})
-    rows.sort(key=lambda r: r["created"], reverse=True)
+                                 {"app": s["app"], "title": privacy.redact(s["window"]["title"])} for s in d["windows"]],
+                     "_mtime": f.stat().st_mtime_ns})
+    rows.sort(key=lambda r: (r["created"], r["_mtime"]), reverse=True)  # mtime orders saves within a second
+    for r in rows:
+        del r["_mtime"]
     return rows[:limit]
 
 

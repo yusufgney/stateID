@@ -21,6 +21,8 @@ directories, text cursor positions and window placement, plus a screenshot of ev
   and read the summary (and screenshots, if the user allows them) before doing anything else.
 - Call list_windows or save_state to see what the user is doing right now.
 - To catch up after a known ID ("what did I do since DK-…?"), call diff_states with that ID.
+- If the user asks to continue without giving an ID, call list_states: the newest state (often
+  an automatic one, `auto: true`, if the user turned automatic saves on) shows where they were.
 - restore_state reopens and rearranges the user's windows: only call it when the user asks.
 - The user's privacy settings hide some windows ("private window") and mask secrets as
   [REDACTED]. Respect that: do not try to work around it or guess hidden content.
@@ -94,7 +96,10 @@ def get_state(state_id: str, include_screenshots: bool = True, max_screenshots: 
 
 @mcp.tool(annotations=READ_ONLY)
 def list_states(limit: int = 20) -> list[dict]:
-    """List saved states, newest first, with their creation time and windows."""
+    """List saved states, newest first, with their creation time and windows.
+
+    `auto` is true for states saved automatically (when the user turned that on), false for ones
+    the user or an agent saved on purpose."""
     with expected_errors():
         return store.list_states(limit)
 

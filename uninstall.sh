@@ -7,6 +7,11 @@ UUID="stateid@yusufgney.github.io"
 KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/stateid/"
 
 gnome-extensions disable "$UUID" 2>/dev/null || true
+if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/stateid-autosave.service" ]]; then
+    systemctl --user disable --now stateid-autosave.service 2>/dev/null || true
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/stateid-autosave.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+fi
 rm -f "$HOME/.local/bin/stateid" "$HOME/.local/bin/stateid-mcp" "$HOME/.local/share/gnome-shell/extensions/$UUID"
 command -v claude >/dev/null && claude mcp remove --scope user stateid >/dev/null 2>&1 || true
 

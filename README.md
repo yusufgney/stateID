@@ -20,6 +20,7 @@ Then just talk to the agent:
 - *"Continue from DK-7SZKSJV0"*: the agent reads what was open and where you were, then picks up the work.
 - *"What did I do since DK-7SZKSJV0?"*: the agent compares that moment with the desktop now.
 - *"What am I working on?"*: the agent lists the windows open right now.
+- *"Continue where I left off"*: with automatic saves on, the agent reads the newest state.
 - *"Restore DK-7SZKSJV0"*: the agent reopens and arranges everything.
 
 | Tool | What it does |
@@ -54,6 +55,7 @@ stateid desktop             save the whole desktop
 stateid restore ID          bring the moment back (or just: stateid ID)
 stateid diff ID [ID2]       what changed since ID (or between two IDs)
 stateid list | show ID | delete ID
+stateid autosave --enable   save automatically when the windows change (off by default)
 stateid run PROGRAM         start a program whose unsaved work is saved too
 stateid config [--init]     privacy settings
 ```
