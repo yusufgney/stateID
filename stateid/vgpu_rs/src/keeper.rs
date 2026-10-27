@@ -29,8 +29,9 @@ pub struct Keeper {
     shared: Mutex<Shared>,
     upstreams: Mutex<HashMap<u32, Arc<UnixStream>>>,      // connection -> socket to the server
     states: Mutex<HashMap<u32, Arc<Mutex<Connection>>>>,  // what each connection set up there
-    pumps: Mutex<HashMap<u32, JoinHandle<()>>>,
+    pumps: Mutex<HashMap<u32, JoinHandle<Option<UnixStream>>>>,  // they give the socket back when paused
     moving: Mutex<HashSet<u32>>,                          // their old server connection is closing
+    pausing: Mutex<HashSet<u32>>,                         // their pump stops at the answer to our ping
     shm_offer: Mutex<HashMap<u32, OwnedFd>>,              // resource id -> shared memory, while rebuilding
 }
 
@@ -68,6 +69,7 @@ impl Keeper {
             states: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
             moving: Mutex::new(HashSet::new()),
+            pausing: Mutex::new(HashSet::new()),
             shm_offer: Mutex::new(HashMap::new()),
         })
     }
@@ -89,24 +91,101 @@ impl Keeper {
         self.states.lock().unwrap().get(&conn).cloned()
     }
 
-    fn pump(&self, conn: u32, sock: UnixStream) {
+    /// Pass on what the server sends. While the connection is being paused only whole answers go on,
+    /// up to the answer to our ping: then the server owes the program nothing, and the socket is
+    /// given back.
+    fn pump(&self, conn: u32, sock: UnixStream) -> Option<UnixStream> {
         let mut buf = vec![0u8; wire::CHUNK];
+        let mut held = Vec::new();  // while pausing: the start of an answer not yet whole
         loop {
             let mut fds = Vec::new();
             let n = wire::recv(sock.as_raw_fd(), &mut buf, &mut fds).unwrap_or(0);
             if n == 0 && fds.is_empty() {
+                if !held.is_empty() {
+                    self.to_proxy(Frame { kind: wire::DATA, conn, data: held, fds });
+                }
                 if !self.moving.lock().unwrap().contains(&conn) {
                     self.to_proxy(Frame::new(wire::CLOSE, conn));
                 }
-                return;
+                return None;
             }
-            if !fds.is_empty() {
-                if let Some(st) = self.state(conn) {
-                    st.lock().unwrap().from_server_fds(&fds);
+            let pausing = self.pausing.lock().unwrap().contains(&conn);
+            let (mut base, mut whole, mut ours) = (0, None, None);  // stream positions
+            if let Some(st) = self.state(conn) {
+                let mut st = st.lock().unwrap();
+                if !fds.is_empty() {
+                    st.from_server_fds(&fds);
+                }
+                base = st.replies.pos - held.len() as u64;
+                let framed = if fds.is_empty() { n } else { n.saturating_sub(1) };  // without the fd's byte
+                for (start, end, cmd) in st.replies.feed(&buf[..framed]) {
+                    if cmd == state::PING_PROTOCOL_VERSION {
+                        if st.pings > 0 {
+                            st.pings -= 1;
+                        } else if pausing {
+                            ours = Some(start);
+                            break;
+                        }
+                    }
+                    whole = Some(end);
                 }
             }
-            self.to_proxy(Frame { kind: wire::DATA, conn, data: buf[..n].to_vec(), fds });
+            held.extend_from_slice(&buf[..n]);
+            // an fd's byte comes after whole answers, and our ping is never followed by one
+            if !pausing || !fds.is_empty() {
+                self.to_proxy(Frame { kind: wire::DATA, conn, data: std::mem::take(&mut held), fds });
+                continue;
+            }
+            let cut = ours.or(whole).map_or(0, |p| (p - base) as usize);
+            if cut > 0 {
+                let rest = held.split_off(cut);
+                self.to_proxy(Frame { kind: wire::DATA, conn, data: std::mem::replace(&mut held, rest), fds });
+            }
+            if ours.is_some() {
+                return Some(sock);
+            }
         }
+    }
+
+    /// Stop passing on what the server sends on `conn`, once it has answered all the program asked
+    /// (the program must not send more meanwhile), and take the server connection back.
+    fn pause(&self, conn: u32) -> io::Result<UnixStream> {
+        let up = self.upstreams.lock().unwrap().remove(&conn)
+            .ok_or_else(|| io::Error::other("no server connection"))?;
+        self.pausing.lock().unwrap().insert(conn);
+        let sent = wire::send(up.as_raw_fd(), &[&vtest(state::PING_PROTOCOL_VERSION, &[])], &[]);
+        let pump = self.pumps.lock().unwrap().remove(&conn);
+        let parked = pump.and_then(|p| p.join().ok().flatten());
+        self.pausing.lock().unwrap().remove(&conn);
+        sent?;
+        parked.ok_or_else(|| io::Error::other("the server connection ended"))
+    }
+
+    /// Read what the GPU holds in each texture, and in each buffer without shared memory, into `st`:
+    /// (resources, bytes, what could not be read and why).
+    fn read_contents(st: &mut Connection, s: &UnixStream) -> io::Result<(usize, usize, Vec<String>)> {
+        let (mut count, mut bytes, mut skipped) = (0, 0, Vec::new());
+        for (id, cmd) in st.resource_creates() {
+            if dw(&cmd, 3) == 0 && dw(&cmd, 12) != 0 {
+                continue;  // a buffer: the program's shared memory has it
+            }
+            let levels = match state::layout(&cmd) {
+                Ok(levels) => levels,
+                Err(why) => {
+                    skipped.push(format!("{id} ({why})"));
+                    continue;
+                }
+            };
+            let mut data = Vec::new();
+            for l in &levels {  // one at a time: the answers can be large
+                wire::send(s.as_raw_fd(), &[&vtest(state::TRANSFER_GET, &l.transfer(id))], &[])?;
+                data.push(read_reply(s, l.size())?.0);
+            }
+            count += 1;
+            bytes += data.iter().map(|d| d.len()).sum::<usize>();
+            st.contents.insert(id, data);
+        }
+        Ok((count, bytes, skipped))
     }
 
     fn start_pump(self: &Arc<Self>, conn: u32, s: UnixStream) -> io::Result<()> {
@@ -140,8 +219,8 @@ impl Keeper {
 
     // ------------------------------------------------------------------ rebuilding
     /// Recreate what `st` describes on a new connection to the server: the setup, the resources with
-    /// the same IDs and the same shared memory, buffer contents from that memory, then every object
-    /// and setting. Textures and render targets come back empty.
+    /// the same IDs and the same shared memory, buffer contents from that memory, other contents read
+    /// back before (st.contents, used up), then every object and setting.
     fn rebuild(&self, st: &mut Connection) -> io::Result<UnixStream> {
         if let Some(p) = &st.problem {
             return Err(io::Error::other(format!("cannot be rebuilt: {p}")));
@@ -159,8 +238,15 @@ impl Keeper {
         if let Some((id, _)) = creates.iter().find(|(id, cmd)| dw(cmd, 12) != 0 && !st.shm.contains_key(id)) {
             return Err(io::Error::other(format!("the shared memory of resource {id} is not known")));
         }
-        let last = creates.last().map_or(0, |(id, _)| *id);
+        // freed resources the settings may still name (any dword that could be their ID), as they were
+        let probe = st.rebuild_commands_from(0).0;
+        let named: HashSet<u32> = (0..probe.len() / 4).map(|i| dw(&probe, i)).collect();
+        let released: HashMap<u32, Vec<u8>> = st.released.iter()
+            .filter(|(id, _)| named.contains(id)).map(|(id, cmd)| (*id, cmd.clone())).collect();
+        let last = creates.last().map_or(0, |(id, _)| *id).max(released.keys().copied().max().unwrap_or(0));
         let live: HashMap<u32, Vec<u8>> = creates.into_iter().collect();
+        // objects whose resource is gone are made on new ones after the last ID
+        let (body, stand_ins) = st.rebuild_commands_from(last + 1);
         {
             let mut offer = self.shm_offer.lock().unwrap();
             for (id, fd) in &st.shm {
@@ -170,8 +256,12 @@ impl Keeper {
         let stand_in = vtest(state::RES_CREATE2, &[0, 0, 64, 0x10, 1, 1, 1, 1, 0, 0, 0]);  // a 1-byte buffer
         let mut gaps = Vec::new();
         let result = (|| -> io::Result<()> {
-            for id in 1..=last {
-                let cmd = live.get(&id).unwrap_or(&stand_in);
+            for id in 1..=last + stand_ins.len() as u32 {
+                // freed IDs are freed again once the objects exist
+                let cmd = match id.checked_sub(last + 1) {
+                    Some(i) => &stand_ins[i as usize],
+                    None => live.get(&id).or(released.get(&id)).unwrap_or(&stand_in),
+                };
                 send(cmd)?;
                 let with_shm = dw(cmd, 12) != 0;
                 let (reply, _fds) = read_reply(&s, if with_shm { 13 } else { 12 })?;  // the fd is ours already
@@ -190,47 +280,72 @@ impl Keeper {
             return Err(io::Error::other(format!("the server did not take the shared memory of {untaken} resources \
                                                  (is vgpu_preload loaded?)")));
         }
-        for id in &gaps {
-            send(&vtest(state::RES_UNREF, &[*id]))?;
-        }
-        st.renumbered(last + 1, gaps);
         // buffers hold what the program last put in their shared memory
         for (id, cmd) in &live {
             if dw(cmd, 3) == 0 && dw(cmd, 12) != 0 {  // a buffer with shared memory
                 send(&vtest(state::TRANSFER_PUT2, &[*id, 0, 0, 0, 0, dw(cmd, 6), 1, 1, 0, 0]))?;
             }
         }
-        let body = st.rebuild_commands();
+        for (id, data) in std::mem::take(&mut st.contents) {
+            let levels = live.get(&id).map(|cmd| state::layout(cmd)).and_then(Result::ok).unwrap_or_default();
+            for (l, d) in levels.iter().zip(&data) {
+                wire::send(s.as_raw_fd(), &[&vtest(state::TRANSFER_PUT, &l.transfer(id)), d], &[])?;
+            }
+        }
         let mut submit = ((body.len() / 4) as u32).to_le_bytes().to_vec();
         submit.extend(state::SUBMIT_CMD.to_le_bytes());
         submit.extend(body);
         send(&submit)?;
+        for id in &gaps {
+            send(&vtest(state::RES_UNREF, &[*id]))?;
+        }
+        st.renumbered(last + stand_ins.len() as u32 + 1, gaps);
         // the server works through a connection in order: once it answers this, all of the above is
         // done, so the program may change its shared memory again
         send(&vtest(state::BUSY_WAIT, &[0, 1]))?;
         read_reply(&s, 12)?;
+        st.replies = state::Replies::default();  // what the server sends from now on is the program's
+        st.pings = 0;
         Ok(s)
     }
 
     /// Move every connection to a new server connection, rebuilt from what was followed. The old
-    /// connection is closed first, so the server answers everything already sent on it.
+    /// connection answers everything already sent on it, and what the GPU holds is read back from it.
     fn move_all(self: &Arc<Self>) {
         let mut conns: Vec<u32> = self.upstreams.lock().unwrap().keys().copied().collect();
         conns.sort_unstable();
         for conn in conns {
             let started = Instant::now();
-            self.moving.lock().unwrap().insert(conn);
-            if let Some(up) = self.upstreams.lock().unwrap().remove(&conn) {
-                let _ = up.shutdown(std::net::Shutdown::Write);
-            }
-            if let Some(pump) = self.pumps.lock().unwrap().remove(&conn) {
-                let _ = pump.join();
-            }
-            self.moving.lock().unwrap().remove(&conn);
             let Some(st) = self.state(conn) else { continue };
+            let followed = st.lock().unwrap().problem.is_none();
+            let old = if followed { self.pause(conn) } else { Err(io::Error::other("not followed")) };
             let mut st = st.lock().unwrap();
+            let read = match old {
+                Ok(old) => Self::read_contents(&mut st, &old).map(|r| (r, started.elapsed())),
+                Err(e) => {
+                    // no contents then; closing the connection still has the server answer what it was sent
+                    self.moving.lock().unwrap().insert(conn);
+                    if let Some(up) = self.upstreams.lock().unwrap().remove(&conn) {
+                        let _ = up.shutdown(std::net::Shutdown::Write);
+                    }
+                    if let Some(pump) = self.pumps.lock().unwrap().remove(&conn) {
+                        let _ = pump.join();
+                    }
+                    self.moving.lock().unwrap().remove(&conn);
+                    Err(e)
+                }
+            };
+            let read = match read {
+                Ok(((n, bytes, skipped), took)) => format!(
+                    "contents of {n} read back ({:.1} MB in {took:.0?}){}", bytes as f64 / 1e6,
+                    if skipped.is_empty() { String::new() } else { format!(", not of {}", skipped.join(", ")) }),
+                Err(e) => {
+                    st.contents.clear();
+                    format!("no contents read back: {e}")
+                }
+            };
             match self.rebuild(&mut st).and_then(|s| self.start_pump(conn, s)) {
-                Ok(()) => eprintln!("stateid-vgpu: connection {conn} rebuilt in {:.0?}: {} resources, {} bytes of state",
+                Ok(()) => eprintln!("stateid-vgpu: connection {conn} rebuilt in {:.0?}: {} resources, {} bytes of state; {read}",
                                     started.elapsed(), st.resources.len(), st.size()),
                 Err(e) => {
                     eprintln!("stateid-vgpu: connection {conn} could not be rebuilt: {e}");

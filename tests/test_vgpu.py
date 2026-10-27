@@ -226,9 +226,10 @@ def vt(cmd, *dwords):
 
 
 @pytest.mark.skipif(not shutil.which("virgl_test_server"), reason="needs virgl_test_server")
-def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory(exe, request, monkeypatch):
-    """A buffer filled through shared memory survives moving to a new server: the new server reads the
-    program's own memory (no copy), which a read-back on the new server proves."""
+def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory_and_contents(exe, request, monkeypatch):
+    """Moving to a new server keeps a buffer filled through shared memory (the new server reads the
+    program's own memory) and a texture whose contents only the GPU holds (they are read back first):
+    reading both back on the new server proves it."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(request.config.cache.mkdir("stateid-vgpu")))
     base = f"/tmp/sgt-{os.getpid()}-{time.monotonic_ns()}"
     os.mkdir(base)
@@ -243,22 +244,32 @@ def test_move_rebuilds_on_a_new_server_with_the_same_shared_memory(exe, request,
         c.sendall(struct.pack("<II", 4, 8) + b"test")  # CREATE_RENDERER
         c.sendall(vt(11, 3))  # PROTOCOL_VERSION
         assert recv_exactly(c, 12)[:8] == struct.pack("<II", 1, 11)
-        c.sendall(vt(RES_CREATE2, 0, 0, 64, 0x10, 64, 1, 1, 1, 0, 0, 64))  # a 64-byte buffer with shm
-        res = struct.unpack("<III", recv_exactly(c, 12))[2]
-        _, fds = recv_chunk(c)
-        shm = mmap.mmap(fds[0], 64)
-        os.close(fds[0])
+        def create(*args):
+            c.sendall(vt(RES_CREATE2, 0, *args, 64))  # 64 bytes of shared memory
+            res = struct.unpack("<III", recv_exactly(c, 12))[2]
+            _, fds = recv_chunk(c)
+            shm = mmap.mmap(fds[0], 64)
+            os.close(fds[0])
+            return res, shm
 
-        def transfer(cmd):  # TRANSFER_PUT2 / GET2 of the whole buffer, then wait until it is done
-            c.sendall(vt(cmd, res, 0, 0, 0, 0, 64, 1, 1, 0, 0) + vt(7, res, 1))
+        def transfer(cmd, res, w, h):  # TRANSFER_PUT2 / GET2 of all of it, then wait until it is done
+            c.sendall(vt(cmd, res, 0, 0, 0, 0, w, h, 1, 0, 0) + vt(7, res, 1))
             recv_exactly(c, 12)
-        shm[:5] = b"hello"
-        transfer(14)
+        buf, buf_shm = create(0, 64, 0x10, 64, 1, 1, 1, 0, 0)  # a 64-byte buffer
+        tex, tex_shm = create(2, 67, 0xa, 4, 4, 1, 1, 0, 0)  # a 4x4 RGBA texture (sampler, render target)
+        buf_shm[:5] = b"hello"
+        transfer(14, buf, 64, 1)
+        tex_shm[:] = bytes(range(64))
+        transfer(14, tex, 4, 4)
+        tex_shm[:] = bytes(64)  # now only the GPU has it
         assert vgpu.control(base, "move")
-        shm[:5] = bytes(5)
-        transfer(13)  # read back from the new server into our memory
-        assert shm[:5] == b"hello"
-        assert "connection 1 rebuilt" in Path(f"{base}/k.log").read_text()
+        buf_shm[:5] = bytes(5)
+        transfer(13, buf, 64, 1)  # read back from the new server into our memory
+        assert buf_shm[:5] == b"hello"
+        transfer(13, tex, 4, 4)
+        assert tex_shm[:] == bytes(range(64))
+        log = Path(f"{base}/k.log").read_text()
+        assert "connection 1 rebuilt" in log and "contents of 1 read back" in log
     finally:
         end(proxy)
         for _ in range(100):  # the keeper ends with the session and stops its server
