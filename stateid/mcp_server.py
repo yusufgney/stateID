@@ -20,6 +20,7 @@ directories, text cursor positions and window placement, plus a screenshot of ev
 - When the user mentions an ID (DK-XXXXXXXX) or asks to continue earlier work, call get_state
   and read the summary and screenshots before doing anything else.
 - Call list_windows or save_state to see what the user is doing right now.
+- To catch up after a known ID ("what did I do since DK-…?"), call diff_states with that ID.
 - restore_state reopens and rearranges the user's windows: only call it when the user asks.
 - The user's privacy settings hide some windows ("private window") and mask secrets as
   [REDACTED]. Respect that: do not try to work around it or guess hidden content.
@@ -63,6 +64,17 @@ def save_state(scope: Literal["desktop", "focused"] = "desktop", window_seq: int
     with expected_errors():
         return core.save(window=window_seq, focused=scope == "focused" and window_seq is None,
                          copy=copy_to_clipboard)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def diff_states(old_state_id: str, new_state_id: str | None = None) -> str:
+    """What changed between two saved states, or since a state if new_state_id is omitted
+    (then the desktop is read now, without saving a new state).
+
+    Lists windows opened and closed, and for the others the changed title, documents, directory,
+    browser tabs, pages and text cursor. Use it to catch up on what the user did since an ID."""
+    with expected_errors():
+        return core.diff(old_state_id, new_state_id)
 
 
 @mcp.tool(annotations=READ_ONLY, structured_output=False)

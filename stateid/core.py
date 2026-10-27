@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime
 
-from . import __version__, a11y, desktops, freeze, privacy, store
+from . import __version__, a11y, desktops, diff as diffs, freeze, privacy, store
 from .adapters import adapter_for
 from .adapters.terminal import resume_argv
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, launch_argv, read_proc,
@@ -73,6 +73,30 @@ def summary(kid):
     data = store.load(kid)
     views = [agent_view(st, cfg) for st in data["windows"]]
     return store.agent_md(data["id"], views, data["created"], data.get("excluded", []))
+
+
+def diff(old_id, new_id=None):
+    """What changed from one state to another, or to the desktop right now (read, not saved).
+    Rendered for agents, with the current privacy settings."""
+    cfg = privacy.load()
+    old = store.load(old_id)
+    old_views = [agent_view(st, cfg) for st in old["windows"]]
+    if new_id:
+        new = store.load(new_id)
+        new_views, created = [agent_view(st, cfg) for st in new["windows"]], new["created"]
+    else:
+        with _lock:
+            wins = desktops.current().windows()
+            for w in wins:
+                w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
+            wins = [w for w in wins if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
+            states = []
+            for w in wins:
+                st = describe_window(w)
+                _apply_privacy(st, cfg)
+                states.append(st)
+        new_views, created = [agent_view(st, cfg) for st in states], datetime.now().isoformat(timespec="seconds")
+    return diffs.report(old["id"], old["created"], old_views, new_id and store.normalize(new_id), created, new_views)
 
 
 def _lock_down(path):

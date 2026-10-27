@@ -18,6 +18,7 @@ Then just talk to the agent:
 
 - *"Save my desktop"*: the agent takes a snapshot and gets an ID.
 - *"Continue from DK-7SZKSJV0"*: the agent reads what was open, where you were and the screenshots, then picks up the work.
+- *"What did I do since DK-7SZKSJV0?"*: the agent compares that moment with the desktop now.
 - *"What am I working on?"*: the agent lists the windows open right now.
 - *"Restore DK-7SZKSJV0"*: the agent reopens and arranges everything.
 
@@ -26,6 +27,7 @@ Then just talk to the agent:
 | `list_windows` | The windows open right now |
 | `save_state` | Snapshot the desktop or one window; returns an ID |
 | `get_state` | A state's summary plus window screenshots |
+| `diff_states` | What changed since a state, or between two states |
 | `list_states` | Saved states, newest first |
 | `restore_state` | Bring a state back on screen (only when you ask) |
 | `delete_state` | Delete a state |
@@ -50,6 +52,7 @@ Save with **Super+Shift+S**, from a window's title-bar menu, or with `stateid de
 ```
 stateid desktop             save the whole desktop
 stateid restore ID          bring the moment back (or just: stateid ID)
+stateid diff ID [ID2]       what changed since ID (or between two IDs)
 stateid list | show ID | delete ID
 stateid run PROGRAM         start a program whose unsaved work is saved too
 stateid config [--init]     privacy settings

@@ -85,6 +85,10 @@ def cmd_show(args):
     print(core.summary(args.id))
 
 
+def cmd_diff(args):
+    print(core.diff(args.old, args.new), end="")
+
+
 def cmd_list(args):
     rows = store.list_states(args.n)
     if not rows:
@@ -174,6 +178,14 @@ def build_parser():
                                    "and paths to the screenshots.")
     s.add_argument("id", help="a state ID")
     s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("diff", help="what changed since a state (or between two states)",
+                       description="Show what changed between two states, or from a state to the desktop "
+                                   "right now: windows opened and closed, and changed titles, documents, "
+                                   "directories, tabs, pages and text cursors. Nothing is saved.")
+    s.add_argument("old", help="the earlier state ID")
+    s.add_argument("new", nargs="?", help="the later state ID (default: the desktop now)")
+    s.set_defaults(fn=cmd_diff)
 
     s = sub.add_parser("list", help="list saved states, newest first",
                        description="List saved states, newest first, with the first windows of each.")
