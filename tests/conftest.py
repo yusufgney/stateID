@@ -1,5 +1,6 @@
 """A fake desktop, so saving and reading windows can be tested without a display."""
 import pytest
+from PIL import Image
 
 from stateid import desktops, privacy, store
 
@@ -9,6 +10,8 @@ class FakeDesktop(desktops.Desktop):
 
     def __init__(self, titles):
         self.titles = titles
+        self.shots = False  # whether capture() works
+        self.activated, self.opened = [], []
 
     def windows(self):
         return [{"seq": i + 1, "pid": 0, "title": t, "app_id": "editor", "wm_class": "Editor", "app_name": "Editor",
@@ -17,7 +20,17 @@ class FakeDesktop(desktops.Desktop):
                  "fullscreen": False} for i, t in enumerate(self.titles)]
 
     def capture(self, seq, path):
-        return False
+        if self.shots:
+            Image.new("RGB", (40, 30), "red").save(path)
+        return self.shots
+
+    def activate(self, seq):
+        self.activated.append(seq)
+        return True
+
+    def open_file(self, path):
+        self.opened.append(path)
+        return "Text Editor"
 
 
 @pytest.fixture

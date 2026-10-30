@@ -27,6 +27,9 @@ Then just talk to the agent:
 |---|---|
 | `read_desktop` | What you are doing now (focused window or all), without saving |
 | `list_windows` | The windows open right now |
+| `get_window_detail` | One window read now, with a live screenshot if you allow them |
+| `focus_window` | Bring a window to the front (only when you ask) |
+| `open_document` | Open a document or folder in its usual app (only when you ask) |
 | `save_state` | Snapshot the desktop or one window; returns an ID |
 | `get_state` | A state's summary (`latest` for the newest), plus screenshots if you allow them |
 | `diff_states` | What changed since a state, or between two states |

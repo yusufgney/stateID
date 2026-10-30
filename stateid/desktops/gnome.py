@@ -7,6 +7,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+from ..procs import spawn  # noqa: E402
 from .base import Desktop, DesktopUnavailable  # noqa: E402
 
 DBUS_PATH, DBUS_IFACE = "/io/github/yusufgney/StateId", "io.github.yusufgney.StateId"
@@ -50,3 +51,11 @@ class GnomeShell(Desktop):
 
     def notify(self, title, body):
         self.call("Notify", "(ss)", title, body)
+
+    def open_file(self, path):
+        try:
+            app = Gio.File.new_for_path(path).query_default_handler(None)
+        except GLib.Error as e:
+            raise LookupError(f"No app opens {path}: {e.message}") from None
+        spawn(["gio", "open", path])  # detached, like the apps a restore starts
+        return app.get_display_name()

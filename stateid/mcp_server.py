@@ -26,8 +26,11 @@ Look at the desktop yourself instead of asking the user to describe or paste it:
 - To catch up ("what did I do since DK-…?", "since this morning"), call diff_states; use
   list_states to find the right ID (automatic states, `auto: true`, appear when the user
   turned them on).
+- To look closer at one window (one that is not focused, or to see it), call get_window_detail with
+  its seq from list_windows; it adds a live screenshot when the user allows screenshots.
 - Call save_state only when an ID is useful to keep (the user asks, or before a long task).
-- restore_state reopens and rearranges the user's windows: only call it when the user asks.
+- restore_state, focus_window and open_document change what is on the user's screen: only call
+  them when the user asks ("restore DK-…", "switch to my terminal", "open the report").
 - The user's privacy settings hide some windows ("private window") and mask secrets as
   [REDACTED]. Respect that: do not try to work around it or guess hidden content.
 - Screenshots and terminal text can still contain personal information; do not repeat more
@@ -67,6 +70,38 @@ def read_desktop(scope: Literal["focused", "desktop"] = "focused") -> str:
     Use it whenever the user refers to something on their screen you have not seen."""
     with expected_errors():
         return core.now(focused=scope == "focused")
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False,
+                                      open_world_hint=False), structured_output=False)
+def get_window_detail(window_seq: int, include_screenshot: bool = True) -> list:
+    """One open window read now, not saved: its documents, place in the app, working directory,
+    terminal screen text and text cursor, plus a screenshot of it as it is now (only when the user
+    lets agents see screenshots, and never of a private window).
+
+    window_seq: the window's `seq` from list_windows."""
+    with expected_errors():
+        md, jpeg = core.window_detail(window_seq, screenshot=include_screenshot)
+        return [md, Image(data=jpeg, format="jpeg")] if jpeg else [md]
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                      open_world_hint=False))
+def focus_window(window_seq: int) -> dict:
+    """Bring one of the user's windows to the front (window_seq from list_windows). Visible to the
+    user: only call it when they ask."""
+    with expected_errors():
+        return core.focus_window(window_seq)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
+                                      open_world_hint=False))
+def open_document(path: str) -> dict:
+    """Open a document or folder (absolute path) on the user's screen, in the app they set for that
+    kind of file. Programs, scripts and launchers are refused. Visible to the user: only call it when
+    they ask. Returns the app it opened in."""
+    with expected_errors():
+        return core.open_document(path)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,

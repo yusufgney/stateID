@@ -46,3 +46,8 @@ class Desktop:
     def notify(self, title, body):
         """Show a desktop notification."""
         raise NotImplementedError
+
+    def open_file(self, path):
+        """Open a file or folder in the app the user set for it; return that app's name.
+        LookupError if no app opens it."""
+        raise NotImplementedError

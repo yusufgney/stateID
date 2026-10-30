@@ -3,9 +3,11 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from . import __version__, a11y, desktops, diff as diffs, freeze, privacy, store
 from .adapters import adapter_for
@@ -103,6 +105,61 @@ def _read_now(cfg, focused=False):
                     if privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
         wins = [w for w in wins if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
         return _describe_all(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"])), cfg), excluded
+
+
+def _open_window(seq, cfg):
+    """The open window `seq`; LookupError when there is none or the privacy settings exclude it."""
+    wins = desktops.current().windows()
+    w = next((w for w in wins if w["seq"] == seq), None)
+    if w is None:
+        raise LookupError(f"No open window {seq}; list_windows shows the open ones")
+    if privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w)):
+        raise LookupError(f"Window {seq} is excluded by the user's privacy settings")
+    w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
+    return w
+
+
+def window_detail(seq, screenshot=True, max_width=1280):
+    """One window read now, not saved: (agent summary, JPEG screenshot or None). The screenshot is
+    taken only when the user lets agents see screenshots and the window is not private."""
+    cfg = privacy.load()
+    p = cfg["privacy"]
+    with _lock:
+        w = _open_window(seq, cfg)
+        st = describe_window(w)
+        _apply_privacy(st, cfg)
+        img = None
+        if screenshot and p["screenshots"] and p["agent_screenshots"] and not is_private(st, cfg):
+            with tempfile.TemporaryDirectory(prefix="stateid-") as d:
+                png = Path(d) / "window.png"
+                if desktops.current().capture(seq, png) and png.exists():
+                    img = store.jpeg(png, max_width)
+    md = store.agent_md(None, [agent_view(st, cfg)], datetime.now().isoformat(timespec="seconds"), screenshots=False)
+    return md, img
+
+
+def focus_window(seq):
+    """Bring an open window to the front. Returns how list_windows shows it."""
+    cfg = privacy.load()
+    with _lock:
+        w = _open_window(seq, cfg)
+        desktops.current().activate(seq)
+    return {**_summary(w, cfg), "focused": True}
+
+
+def open_document(path):
+    """Open a document or folder in the app the user set for it. Programs, scripts and launchers are
+    refused: this opens things to look at, it does not run them."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise LookupError(f"Give an absolute path, not {path!r}")
+    if not p.exists():
+        raise LookupError(f"No such file or folder: {p}")
+    if p.is_file() and (os.access(p, os.X_OK) or p.suffix.lower() == ".desktop"):
+        raise LookupError(f"{p} is a program or launcher; open_document only opens documents and folders")
+    with _lock:
+        app = desktops.current().open_file(str(p))
+    return {"opened": str(p), "app": app}
 
 
 def now(focused=False):

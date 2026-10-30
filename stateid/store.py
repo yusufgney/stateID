@@ -99,6 +99,11 @@ def screenshot(kid, name, max_width=1280, quality=80):
     f = path(kid) / name
     if not re.fullmatch(r"window\d+\.png", name) or not f.exists():
         return None
+    return jpeg(f, max_width, quality)
+
+
+def jpeg(f, max_width=1280, quality=80):
+    """An image file scaled down to max_width and JPEG-encoded; None if it cannot be read."""
     try:
         with Image.open(f) as im:
             im.load()
@@ -173,7 +178,8 @@ def agent_md(kid, states, created, excluded=(), screenshots=True):
     place in the app and screen text. `states` must already be agent views (see core.agent_view).
     Screenshot paths are listed only when the user lets agents see screenshots.
     kid None: the desktop as read now, not saved."""
-    focus = next((st for st in states if st["window"].get("focused")), states[0] if states else None)
+    # read now, only a focused window is where the user works; a saved state names its first one at least
+    focus = next((st for st in states if st["window"].get("focused")), states[0] if states and kid else None)
     lines = [f"# State {kid}", "", f"Saved {created}: {len(states)} window(s)."] if kid else \
         ["# Desktop now", "", f"Read {created}, not saved: {len(states)} window(s)."]
     if focus is not None:
