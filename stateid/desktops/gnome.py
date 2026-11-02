@@ -42,6 +42,15 @@ class GnomeShell(Desktop):
     def activate(self, seq):
         return self.call("Activate", "(u)", seq)
 
+    def save_window(self, seq):
+        try:
+            return self.call("SaveWindow", "(u)", seq)
+        except DesktopUnavailable as e:
+            if "UnknownMethod" in str(e):
+                raise DesktopUnavailable("The GNOME Shell extension is older than stateid: log out and back "
+                                         "in once so it can save windows.") from None
+            raise
+
     def move_resize(self, seq, rect, maximize):
         r = rect
         return self.call("MoveResize", "(uiiiib)", seq, r["x"], r["y"], r["width"], r["height"], maximize)

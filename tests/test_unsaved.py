@@ -1,7 +1,7 @@
 """Unsaved work: said plainly when a state does not hold it, and freezing kept for work that cannot be saved."""
 import pytest
 
-from stateid import cli, core, freeze, privacy, store
+from stateid import apps, cli, core, freeze, privacy, store
 
 
 def test_save_says_unsaved_changes_are_not_in_the_state(desk):
@@ -21,10 +21,10 @@ def test_a_frozen_session_keeps_its_unsaved_work():
 
 
 def test_programs_that_save_themselves():
-    assert freeze.saves_itself(["/usr/bin/soffice", "--writer"]) == "LibreOffice"
-    assert freeze.saves_itself(["gimp-2.10", "x.png"]) == "GIMP"
-    assert freeze.saves_itself(["python3", "train.py"]) is None
-    assert freeze.saves_itself(["PacketTracer"]) is None
+    assert apps.saves_itself(["/usr/bin/soffice", "--writer"]) == "LibreOffice"
+    assert apps.saves_itself(["gimp-2.10", "x.png"]) == "GIMP"
+    assert apps.saves_itself(["python3", "train.py"]) is None
+    assert apps.saves_itself(["PacketTracer"]) is None
 
 
 def test_run_refuses_a_program_that_saves_itself(tmp_path, monkeypatch):

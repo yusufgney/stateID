@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, a11y, desktops, diff as diffs, freeze, privacy, store
+from . import __version__, a11y, apps, desktops, diff as diffs, freeze, privacy, store
 from .adapters import adapter_for
 from .adapters.terminal import resume_argv
 from .procs import (cmdline, descendants, desktop_command, file_arg_docs, files_from_title, launch_argv, read_proc,
@@ -173,10 +173,11 @@ def now(focused=False):
 
 
 def _lock_down(path):
-    """States hold screenshots and terminal text: readable by the user only."""
-    os.chmod(path, 0o700)
-    for f in path.iterdir():
-        os.chmod(f, 0o600)
+    """States hold screenshots, terminal text and documents: readable by the user only."""
+    for top, dirs, files in os.walk(path):
+        os.chmod(top, 0o700)
+        for f in files:
+            os.chmod(os.path.join(top, f), 0o600)
 
 
 def prune(keep_days):
@@ -227,7 +228,7 @@ def describe_window(w):
         "command": cmd,
         "cwd": cwd,
         "files": list(dict.fromkeys(files)),
-        "unsaved": bool(re.match(r"^\s*[•*●]", w["title"] or "")),
+        "unsaved": apps.unsaved(w["title"]),
         "app_state": None,
         "restore_cmd": None,
     }
@@ -288,31 +289,51 @@ def freeze_sessions(states):
             a["freeze_error"] = str(e)
 
 
-def save(window=None, focused=False, copy=False, screenshots=True, auto=False):
+def _matching(shell, window, focused, p, seqs=None):
+    """The windows to save and those the privacy settings exclude. seqs: only these windows."""
+    wins = shell.windows()
+    for w in wins:
+        w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
+    if seqs is not None:
+        wins = [w for w in wins if w["seq"] in seqs]
+    elif window is not None:
+        wins = [w for w in wins if w["seq"] == window]
+    elif focused:
+        wins = [w for w in wins if w["focused"]]
+    if not wins:
+        raise LookupError("No matching window")
+    excluded = [w for w in wins if privacy.matches(p["exclude"], *privacy.window_fields(w))]
+    wins = [w for w in wins if w not in excluded]
+    if not wins:
+        raise LookupError(f"Every matching window is excluded by the privacy settings ({privacy.CONFIG_PATH})")
+    return wins, excluded
+
+
+def save(window=None, focused=False, copy=False, screenshots=True, auto=False, save_apps=False):
     """Snapshot windows (all, one by sequence number, or the focused one). Returns the new state's summary,
     already filtered for agents.
 
+    save_apps: first have programs that save their own work save it (Ctrl+S in windows showing unsaved
+    changes); the state then keeps a copy of their documents as saved. Never done by automatic saves.
     auto: an automatic save of the whole desktop. It is skipped (returns None) when nothing changed since
     the last automatic state, does not freeze `stateid run` sessions and is pruned by [autosave] keep."""
     cfg = privacy.load()
     p = cfg["privacy"]
     with _lock:
         shell = desktops.current()
-        wins = shell.windows()
-        for w in wins:
-            w["app_window_count"] = sum(o["app_id"] == w["app_id"] for o in wins)
-        if window is not None:
-            wins = [w for w in wins if w["seq"] == window]
-        elif focused:
-            wins = [w for w in wins if w["focused"]]
-        if not wins:
-            raise LookupError("No matching window")
-        excluded = [w for w in wins if privacy.matches(p["exclude"], *privacy.window_fields(w))]
-        wins = [w for w in wins if w not in excluded]
-        if not wins:
-            raise LookupError("Every matching window is excluded by the privacy settings "
-                              f"({privacy.CONFIG_PATH})")
+        wins, excluded = _matching(shell, window, focused, p)
+        saved_in_app = {}
+        if save_apps and not auto:
+            saved_in_app = apps.save_in_apps(shell, wins)
+            if saved_in_app:  # titles lose their unsaved marker; the focus went back
+                wins, excluded = _matching(shell, window, focused, p, [w["seq"] for w in wins + excluded])
         states = _describe_all(sorted(wins, key=lambda w: (not w["focused"], -w["user_time"])), cfg)
+        for st in states:
+            if st["window"]["seq"] in saved_in_app:
+                st["saved_in_app"] = saved_in_app[st["window"]["seq"]]
+            exe = read_proc(st["window"]["pid"], "exe") if st["window"].get("pid") else None
+            if not auto and exe and apps.saves_itself(st["command"]):
+                st["app_version"] = apps.package_of(exe)
         if auto:
             last = next((r for r in store.list_states(limit=None) if r.get("auto")), None)
             if last and unchanged(store.load(last["id"]), states, cfg):
@@ -328,6 +349,7 @@ def save(window=None, focused=False, copy=False, screenshots=True, auto=False):
                 st["screenshot"] = png
         if not auto:
             freeze_sessions(states)
+            store.copy_docs(d, states)
         created = datetime.now().isoformat(timespec="seconds")
         scope = "window" if window is not None or focused else "desktop"
         excluded_apps = [w["app_name"] or w["wm_class"] for w in excluded]
@@ -348,7 +370,9 @@ def save(window=None, focused=False, copy=False, screenshots=True, auto=False):
             "pruned_old_states": len(pruned),
             "windows": [{"app": v["app"], "private": True} if v.get("private") else
                         {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5],
-                         **({"unsaved": True} if store.unsaved_lost(st) else {})}
+                         **({"unsaved": True} if store.unsaved_lost(st) else {}),
+                         **({"saved_in_app": st["saved_in_app"]} if st.get("saved_in_app") else {}),
+                         **({"documents_kept": len(st["docs"])} if st.get("docs") else {})}
                         for v, st in zip(views, states)]}
 
 
@@ -394,6 +418,48 @@ def _same_app(a, b):
     return (a["app_id"] and a["app_id"] == b["app_id"]) or (a["wm_class"] and a["wm_class"] == b["wm_class"])
 
 
+def updates():
+    """Updates waiting for the programs of the open windows and of frozen sessions, and what each would
+    mean for the user's work (see apps.check_update). Nothing is installed."""
+    cfg = privacy.load()
+    wins = [w for w in desktops.current().windows()
+            if not privacy.matches(cfg["privacy"]["exclude"], *privacy.window_fields(w))]
+    progs = dict((os.path.realpath(exe), app) for app, exe in apps.programs(wins))
+    frozen = set()
+    if freeze.available():
+        try:
+            images = freeze.sessions()["images"]
+        except (freeze.HelperUnavailable, freeze.HelperError):
+            images = []
+        for m in images:
+            exe = shutil.which((m.get("argv") or [""])[0])
+            if exe:
+                exe = os.path.realpath(exe)
+                frozen.add(exe)
+                progs.setdefault(exe, apps.saves_itself(m["argv"]) or os.path.basename(exe))
+    rows = []
+    for exe, app in progs.items():
+        info = apps.package_of(exe)
+        if info:
+            rows.append(apps.check_update(app, info, frozen=exe in frozen))
+    age = apps.apt_lists_age()
+    return {"programs": rows,
+            "note": None if age is None else f"apt package lists were downloaded {age:.0f} day(s) ago; "
+                                             "`sudo apt update` refreshes them"}
+
+
+def _since_notes(kid, st):
+    """What changed since the state for a saved window: its documents and its program's version."""
+    notes = [f"{os.path.basename(f)} changed since this state; the version kept in it is at {copy}"
+             for f, copy in store.changed_docs(kid, st)]
+    then = st.get("app_version")
+    if then and then.get("version"):
+        now = apps.package_of(shutil.which(st["command"][0]) or st["command"][0]) if st.get("command") else None
+        if now and now.get("version") and now["version"] != then["version"]:
+            notes.append(f"saved with {st['app']} {then['version']}, now {now['version']}")
+    return notes
+
+
 def restore(kid):
     """Bring a saved moment back. Returns a per-window report."""
     data = store.load(kid)
@@ -412,6 +478,7 @@ def restore(kid):
                 match = same[0]
             item = {"app": st["app"], "title": w["title"], "launched": [], "actions": [], "notes": [],
                     "_st": st, "_ad": ad, "_win": match}
+            item["notes"] += _since_notes(data["id"], st)
             if match:
                 used.add(match["seq"])
                 item["status"] = "already open"

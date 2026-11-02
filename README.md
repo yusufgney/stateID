@@ -30,7 +30,8 @@ Then just talk to the agent:
 | `get_window_detail` | One window read now, with a live screenshot if you allow them |
 | `focus_window` | Bring a window to the front (only when you ask) |
 | `open_document` | Open a document or folder in its usual app (only when you ask) |
-| `save_state` | Snapshot the desktop or one window; returns an ID |
+| `save_state` | Save the programs' work (their own save), snapshot the desktop or one window; returns an ID |
+| `check_updates` | Updates waiting for your programs and the risk each means for your saved work |
 | `get_state` | A state's summary (`latest` for the newest), plus screenshots if you allow them |
 | `diff_states` | What changed since a state, or between two states |
 | `list_states` | Saved states, newest first |
@@ -62,6 +63,7 @@ stateid list | show ID | delete ID     (show latest: the newest state)
 stateid now [--focused]     the summary of the desktop now, without saving
 stateid autosave --enable   save automatically when the windows change (off by default)
 stateid run PROGRAM         start a program whose memory is saved too (work it cannot save)
+stateid updates             updates waiting for your programs, and whether they are safe for your work
 stateid config [--init]     privacy settings
 ```
 
@@ -69,6 +71,7 @@ stateid config [--init]     privacy settings
 
 - **Any app:** windows, position and workspace, open documents, working directory, text cursor and a screenshot.
 - **Deeper app state:** OnlyOffice (slide, pen, slideshow), Chromium browsers (tabs), terminals (directories, resumed Claude Code sessions), Nautilus, Evince and VS Code. More apps, other Linux desktops and Windows 11 are planned.
+- **Work in programs that save themselves:** saving a state first presses Ctrl+S in windows with unsaved changes (editors, office suites, image tools) and keeps a copy of their documents in the state; restoring tells you when a document changed since and gives you the copy. Automatic saves never write your files; `--no-save-apps` turns it off. Tried with GNOME Text Editor in a test GNOME session, not yet with other apps or on a real desktop.
 - **Work that cannot be saved (experimental):** for programs without a save of their own and for long-running jobs. A program started with `stateid run` has its whole memory frozen with [CRIU](https://criu.org) when you save, so it comes back on restore exactly where it was. Programs that save their own work (LibreOffice, VS Code, GIMP, …) are left to their own saving: `stateid run` refuses them unless you add `--anyway`, and a state tells you when a window had unsaved changes that it does not hold. Programs in these sessions draw without the GPU; `stateid run --gpu` lets OpenGL programs use it through [virgl](https://docs.mesa3d.org/drivers/virgl.html) (tried with Intel and NVIDIA); its relay is built with `cargo` on first use. Its GPU state is saved with the frozen session and rebuilt on restore (tried with an OpenGL demo and GTK 4 apps on NVIDIA and Intel, restoring the same image twice and after a reboot). Vulkan programs draw in software ([lavapipe](https://docs.mesa3d.org/drivers/lavapipe.html)), also with `--gpu`; this was tried with a small Vulkan test program, not yet with real apps.
 
 ## Privacy

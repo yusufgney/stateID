@@ -7,7 +7,6 @@ being frozen (a connection leaving the frozen process tree cannot be checkpointe
 """
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -17,22 +16,6 @@ from pathlib import Path
 
 SOCKET_PATH = os.environ.get("STATEID_HELPER_SOCKET", "/run/stateid/helper.sock")
 VIEWERS = ("xtigervncviewer", "vncviewer")
-# Programs that save their own work (documents, projects, drafts). Freezing is for work that cannot be
-# saved and for long-running jobs; these are better left to their own saving and recovery.
-SELF_SAVING = {
-    "soffice": "LibreOffice", "libreoffice": "LibreOffice", "lowriter": "LibreOffice",
-    "localc": "LibreOffice", "loimpress": "LibreOffice", "desktopeditors": "OnlyOffice",
-    "onlyoffice-desktopeditors": "OnlyOffice", "code": "VS Code", "codium": "VSCodium",
-    "gnome-text-editor": "Text Editor", "gedit": "gedit", "kate": "Kate", "kwrite": "KWrite",
-    "mousepad": "Mousepad", "xed": "Xed", "pluma": "Pluma", "gimp": "GIMP", "inkscape": "Inkscape",
-    "krita": "Krita", "xournalpp": "Xournal++", "blender": "Blender", "freecad": "FreeCAD",
-}
-
-
-def saves_itself(argv):
-    """The name of the program in argv when it is known to save its own work, else None."""
-    name = re.sub(r"[-_]?\d+(\.\d+)*$", "", os.path.basename(argv[0]).lower())
-    return SELF_SAVING.get(name)
 
 
 class HelperUnavailable(Exception):

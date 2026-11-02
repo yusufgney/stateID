@@ -1,10 +1,12 @@
 """Saved states on disk: ~/.local/share/stateid/<ID>/{state.json, AGENT.md, windowN.png}."""
+import hashlib
+import io
 import json
 import os
 import re
 import secrets
-import io
 import shutil
+import stat
 from pathlib import Path
 
 from PIL import Image
@@ -91,7 +93,77 @@ def delete(kid):
             except (freeze.HelperUnavailable, freeze.HelperError):
                 pass
     shutil.rmtree(path(kid))
+    shutil.rmtree(restored(kid), ignore_errors=True)
     return normalize(kid)
+
+
+DOC_FILE_LIMIT = 50 * 2**20  # a document larger than this is not copied into a state
+DOC_STATE_LIMIT = 200 * 2**20  # nor more than this in one state
+
+
+def restored(kid):
+    """Where a state's copies of documents that changed since are put back (never over the documents)."""
+    return STORE / "restored" / normalize(kid)
+
+
+def _sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def copy_docs(d, states):
+    """Keep a copy of every window's open documents in the state folder d, so the state can go back to
+    them as they were even after they change. Sets st["docs"] to [{path, copy, size, sha256}] and lists
+    documents too large to keep in st["docs_skipped"]. Links and special files are not followed."""
+    total = 0
+    for i, st in enumerate(states, 1):
+        docs, skipped = [], []
+        for n, f in enumerate(st.get("files") or [], 1):
+            try:
+                fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as src:
+                info = os.fstat(src.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if info.st_size > DOC_FILE_LIMIT or total + info.st_size > DOC_STATE_LIMIT:
+                    skipped.append(f)
+                    continue
+                rel = f"docs/{i}-{n}/{os.path.basename(f)}"
+                (d / rel).parent.mkdir(parents=True, mode=0o700)
+                with open(d / rel, "xb") as dst:
+                    shutil.copyfileobj(src, dst)
+            total += info.st_size
+            docs.append({"path": f, "copy": rel, "size": info.st_size, "sha256": _sha256(d / rel)})
+        if docs:
+            st["docs"] = docs
+        if skipped:
+            st["docs_skipped"] = skipped
+
+
+def changed_docs(kid, st):
+    """Documents of a saved window that changed (or vanished) since the state: [(path, copy put back)].
+    The state's copy is put next to the other restored copies, never over the document itself."""
+    out = []
+    for doc in st.get("docs") or []:
+        try:
+            same = _sha256(doc["path"]) == doc["sha256"]
+        except OSError:
+            same = False
+        if same:
+            continue
+        src = path(kid) / doc["copy"]
+        dst = restored(kid) / Path(doc["copy"]).relative_to("docs")
+        if not dst.exists() and src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            dst.chmod(0o600)
+        out.append((doc["path"], str(dst)))
+    return out
 
 
 def screenshot(kid, name, max_width=1280, quality=80):
@@ -214,6 +286,12 @@ def agent_md(kid, states, created, excluded=(), screenshots=True):
             lines.append("- **Has unsaved changes** (title marker)" + (
                 ": they are not in this state; only the app can save them (or its own draft recovery)"
                 if kid else ""))
+        if st.get("saved_in_app") == "saved":
+            lines.append("- Saved with the app's own save just before this state")
+        elif st.get("saved_in_app"):
+            lines.append(f"- Not saved in the app: {st['saved_in_app']}")
+        if st.get("docs"):
+            lines.append(f"- This state keeps a copy of its {len(st['docs'])} document(s) as they were")
         if st["cwd"]:
             lines.append(f"- Working directory: `{st['cwd']}`")
         if st["files"]:

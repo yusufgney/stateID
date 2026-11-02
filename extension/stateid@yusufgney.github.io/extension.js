@@ -1,6 +1,7 @@
 // stateid: adds "Copy state ID" items to the window menu (right-click a title bar,
 // or Super + right-click anywhere in a window) and exposes the D-Bus interface the
-// `stateid` command uses to list, capture, place and focus windows.
+// `stateid` command uses to list, capture, place, focus and save windows.
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -25,6 +26,7 @@ const IFACE = `
       <arg type="b" direction="out"/>
     </method>
     <method name="Activate"><arg type="u" direction="in"/><arg type="b" direction="out"/></method>
+    <method name="SaveWindow"><arg type="u" direction="in"/><arg type="b" direction="out"/></method>
     <method name="MoveResize">
       <arg type="u" direction="in"/>
       <arg type="i" direction="in"/><arg type="i" direction="in"/>
@@ -87,6 +89,38 @@ async function capture(win, path) {
     return true;
 }
 
+const wait = ms => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+    resolve();
+    return GLib.SOURCE_REMOVE;
+}));
+
+let keyboard = null;
+const HELD = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK |
+    Clutter.ModifierType.MOD1_MASK | Clutter.ModifierType.SUPER_MASK | Clutter.ModifierType.MOD4_MASK;
+
+// Focus the window and press Ctrl+S in it, as the user would: the app saves with its own save.
+// Waits until the user lets go of the keys (Super+Shift+S may still be held: with Shift it would
+// be Save As).
+async function pressSave(win) {
+    for (let i = 0; i < 40 && (global.get_pointer()[2] & HELD); i++)
+        await wait(25);
+    if (global.get_pointer()[2] & HELD)
+        return false;
+    Main.activateWindow(win);
+    for (let i = 0; i < 40 && !win.has_focus(); i++)
+        await wait(25);
+    if (!win.has_focus())
+        return false;
+    keyboard ??= Clutter.get_default_backend().get_default_seat()
+        .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+    const t = GLib.get_monotonic_time();
+    keyboard.notify_keyval(t, Clutter.KEY_Control_L, Clutter.KeyState.PRESSED);
+    keyboard.notify_keyval(t, Clutter.KEY_s, Clutter.KeyState.PRESSED);
+    keyboard.notify_keyval(t, Clutter.KEY_s, Clutter.KeyState.RELEASED);
+    keyboard.notify_keyval(t, Clutter.KEY_Control_L, Clutter.KeyState.RELEASED);
+    return true;
+}
+
 async function runStateId(args) {
     try {
         const proc = Gio.Subprocess.new([STATEID_BIN, ...args],
@@ -119,6 +153,16 @@ class StateIdService {
         if (win)
             Main.activateWindow(win);
         return win !== null;
+    }
+
+    async SaveWindowAsync([seq], invocation) {
+        try {
+            const win = findWindow(seq);
+            invocation.return_value(new GLib.Variant('(b)', [win ? await pressSave(win) : false]));
+        } catch (e) {
+            logError(e, 'stateid: save');
+            invocation.return_value(new GLib.Variant('(b)', [false]));
+        }
     }
 
     MoveResize(seq, x, y, w, h, maximize) {
@@ -168,5 +212,7 @@ export default class StateIdExtension extends Extension {
         this._origBuild = null;
         this._service?.unexport();
         this._service = null;
+        keyboard?.run_dispose();
+        keyboard = null;
     }
 }

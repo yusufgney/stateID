@@ -35,6 +35,11 @@ class Desktop:
         """Focus the window and raise it."""
         raise NotImplementedError
 
+    def save_window(self, seq):
+        """Focus the window and press the app's save shortcut (Ctrl+S) in it; return whether the keys
+        were sent. Whether the app saved shows in its title (see apps.save_in_apps)."""
+        raise NotImplementedError
+
     def move_resize(self, seq, rect, maximize):
         """Put the window at rect, or maximize it."""
         raise NotImplementedError

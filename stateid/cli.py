@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-from . import __version__, autosave, core, freeze, privacy, store
+from . import __version__, apps, autosave, core, freeze, privacy, store
 from .desktops import DesktopUnavailable
 
 DESCRIPTION = """\
@@ -56,14 +56,40 @@ set STATEID_DIR to use another folder."""
 
 
 def cmd_save(args):
-    print(core.save(window=args.window, focused=args.focused, copy=args.copy)["id"])
+    result = core.save(window=args.window, focused=args.focused, copy=args.copy, save_apps=not args.no_save_apps)
+    print(result["id"])
+    _not_saved(result)
+
+
+def _not_saved(result):
+    for w in result["windows"]:
+        if w.get("saved_in_app") not in (None, "saved"):
+            print(f"  {w['app']} — {w['title']}: not saved in the app: {w['saved_in_app']}", file=sys.stderr)
+
+
+def cmd_updates(args):
+    data = core.updates()
+    for r in data["programs"]:
+        if r["available"] is None:
+            print(f"{r['app']} {r['installed']}: up to date")
+        elif r["available"] == "unknown":
+            print(f"{r['app']} {r['installed']}: {r['why']}")
+        else:
+            print(f"{r['app']} {r['installed']} -> {r['available']}  [{r['risk']} risk] {r['why']}")
+            if r["command"]:
+                print(f"    update with: {r['command']}")
+    if data["note"]:
+        print(f"\n({data['note']})")
 
 
 def cmd_desktop(args):
-    result = core.save(copy=not args.no_copy)
+    result = core.save(copy=not args.no_copy, save_apps=not args.no_save_apps)
     print(result["id"] + ("" if args.no_copy else "    (copied to the clipboard)"))
     for w in result["windows"]:
         print(f"  • {w['app']}" + ("" if w.get("private") else f" — {w['title']}")
+              + ("\n    saved in the app first" if w.get("saved_in_app") == "saved" else "")
+              + (f"\n    not saved in the app: {w['saved_in_app']}" if w.get("saved_in_app") not in (None, "saved")
+                 else "")
               + ("\n    unsaved changes are not in this ID: save them in the app" if w.get("unsaved") else ""))
     if result["excluded_windows"]:
         print(f"  ({result['excluded_windows']} window(s) skipped by your privacy settings)")
@@ -149,7 +175,7 @@ def cmd_run(args):
     cfg = privacy.load()
     if privacy.matches(cfg["privacy"]["exclude"], os.path.basename(args.command[0]), " ".join(args.command)):
         sys.exit(f"{args.command[0]} is excluded by your privacy settings; it will not be frozen")
-    app = freeze.saves_itself(args.command)
+    app = apps.saves_itself(args.command)
     if app and not args.anyway:
         sys.exit(f"{app} saves its own work: save in {app} (stateid reopens its documents) "
                  "instead of freezing it. Freezing is meant for work that cannot be saved and for "
@@ -183,6 +209,10 @@ def cmd_sessions(args):
         print(f"\n{len(data['images'])} frozen image(s), {total:.0f} MB")
 
 
+NO_SAVE_APPS = ("do not have programs that save their own work save first (by default windows showing "
+                "unsaved changes get Ctrl+S, and the state keeps a copy of their documents)")
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="stateid", description=DESCRIPTION, epilog=EPILOG,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -198,13 +228,22 @@ def build_parser():
                    help="only the window with this sequence number (as used by the window menu)")
     g.add_argument("--focused", action="store_true", help="only the window that has the keyboard focus")
     s.add_argument("--copy", action="store_true", help="also copy the ID to the clipboard and show a notification")
+    s.add_argument("--no-save-apps", action="store_true", help=NO_SAVE_APPS)
     s.set_defaults(fn=cmd_save)
 
     s = sub.add_parser("desktop", help="save the whole desktop and copy its ID (same as Super+Shift+S)",
                        description="Snapshot every open window, copy the new state ID to the clipboard and list "
                                    "what was saved. Same as `stateid save --copy`, with a summary.")
     s.add_argument("--no-copy", action="store_true", help="do not touch the clipboard; only print the ID")
+    s.add_argument("--no-save-apps", action="store_true", help=NO_SAVE_APPS)
     s.set_defaults(fn=cmd_desktop)
+
+    s = sub.add_parser("updates", help="updates waiting for your programs, and whether they are safe for your work",
+                       description="List the programs of the open windows and of frozen sessions with the newer "
+                                   "version waiting for each, the risk an update means for saved work (high: "
+                                   "frozen sessions of it would no longer restore; medium: a new major version) "
+                                   "and the command to update. Nothing is installed.")
+    s.set_defaults(fn=cmd_updates)
 
     s = sub.add_parser("restore", help="bring a saved moment back (shortcut: stateid ID)",
                        description="Reopen what is closed, reuse what is already open, put every window back in "

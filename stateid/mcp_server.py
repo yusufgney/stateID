@@ -28,7 +28,11 @@ Look at the desktop yourself instead of asking the user to describe or paste it:
   turned them on).
 - To look closer at one window (one that is not focused, or to see it), call get_window_detail with
   its seq from list_windows; it adds a live screenshot when the user allows screenshots.
-- Call save_state only when an ID is useful to keep (the user asks, or before a long task).
+- Call save_state only when an ID is useful to keep (the user asks, or before a long task). It first
+  has programs that save their own work save it (Ctrl+S in windows with unsaved changes) and keeps a
+  copy of their documents in the state, so the ID continues from the work as saved.
+- Before the user updates a program, or when they ask about updates, call check_updates and tell them
+  the risk for their saved work. Never run an update command without the user's yes.
 - restore_state, focus_window and open_document change what is on the user's screen: only call
   them when the user asks ("restore DK-…", "switch to my terminal", "open the report").
 - The user's privacy settings hide some windows ("private window") and mask secrets as
@@ -107,18 +111,33 @@ def open_document(path: str) -> dict:
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False,
                                       open_world_hint=False))
 def save_state(scope: Literal["desktop", "focused"] = "desktop", window_seq: int | None = None,
-               copy_to_clipboard: bool = False) -> dict:
+               copy_to_clipboard: bool = False, save_apps: bool = True) -> dict:
     """Snapshot the user's windows and return the new state ID with a short summary.
 
     scope: "desktop" for every window, "focused" for the window the user is working in.
     window_seq: snapshot only this window (from list_windows); overrides scope.
     copy_to_clipboard: also put the ID on the user's clipboard and show a notification.
-    A window marked `unsaved` had unsaved changes that the state does not hold: tell the user to save
-    them in the app if they matter.
+    save_apps: first have programs that save their own work (editors, office suites, image tools) save
+    it, as the user would with Ctrl+S; their documents are then kept in the state as saved. Set it to
+    false when the user does not want their files written.
+    `saved_in_app` per window says "saved" or why it was not (e.g. an untitled document needs a name).
+    A window marked `unsaved` still had unsaved changes that the state does not hold: tell the user.
     Call get_state with the returned ID for the full details and screenshots."""
     with expected_errors():
         return core.save(window=window_seq, focused=scope == "focused" and window_seq is None,
-                         copy=copy_to_clipboard)
+                         copy=copy_to_clipboard, save_apps=save_apps)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
+                                      open_world_hint=True))
+def check_updates() -> dict:
+    """Updates waiting for the programs of the user's open windows and frozen sessions. For each:
+    installed and available version, the risk an update means for the user's saved work ("high": frozen
+    sessions of the program would no longer restore; "medium": a new major version whose file or session
+    format may change; "low"), why, and the command that updates it. Nothing is installed: tell the user
+    the risk and ask before running any update command."""
+    with expected_errors():
+        return core.updates()
 
 
 @mcp.tool(annotations=READ_ONLY)
