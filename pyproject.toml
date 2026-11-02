@@ -25,7 +25,7 @@ stateid = "stateid.cli:main"
 stateid-mcp = "stateid.mcp_server:main"
 
 [tool.setuptools]
-packages = ["stateid", "stateid.adapters"]
+packages = ["stateid", "stateid.adapters", "stateid.desktops"]
 
 [tool.setuptools.package-data]
 stateid = ["*.c", "vgpu_rs/Cargo.toml", "vgpu_rs/Cargo.lock", "vgpu_rs/src/*.rs"]
