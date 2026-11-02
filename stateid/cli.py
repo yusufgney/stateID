@@ -63,7 +63,8 @@ def cmd_desktop(args):
     result = core.save(copy=not args.no_copy)
     print(result["id"] + ("" if args.no_copy else "    (copied to the clipboard)"))
     for w in result["windows"]:
-        print(f"  • {w['app']}" + ("" if w.get("private") else f" — {w['title']}"))
+        print(f"  • {w['app']}" + ("" if w.get("private") else f" — {w['title']}")
+              + ("\n    unsaved changes are not in this ID: save them in the app" if w.get("unsaved") else ""))
     if result["excluded_windows"]:
         print(f"  ({result['excluded_windows']} window(s) skipped by your privacy settings)")
     print(f"\nGo back to this moment with: stateid {result['id']}")
@@ -148,6 +149,11 @@ def cmd_run(args):
     cfg = privacy.load()
     if privacy.matches(cfg["privacy"]["exclude"], os.path.basename(args.command[0]), " ".join(args.command)):
         sys.exit(f"{args.command[0]} is excluded by your privacy settings; it will not be frozen")
+    app = freeze.saves_itself(args.command)
+    if app and not args.anyway:
+        sys.exit(f"{app} saves its own work: save in {app} (stateid reopens its documents) "
+                 "instead of freezing it. Freezing is meant for work that cannot be saved and for "
+                 "long-running jobs; add --anyway to start it in a freezable session regardless.")
     argv = args.command
     if args.gpu:
         from . import vgpu
@@ -252,12 +258,16 @@ def build_parser():
     s = sub.add_parser("run", help="start a program whose memory can be saved (unsaved work included)",
                        description="Start PROGRAM in a freezable session: it runs on its own virtual display "
                                    "and is shown in a viewer window. `stateid save` then freezes its whole "
-                                   "memory, so restoring brings back unsaved changes too. Needs the freeze "
-                                   "helper (`install.sh --with-freeze`).")
+                                   "memory, so restoring brings back unsaved changes too. Meant for work that "
+                                   "cannot be saved and long-running jobs; programs that save their own work "
+                                   "are refused unless --anyway is given. Needs the freeze helper "
+                                   "(`install.sh --with-freeze`).")
     s.add_argument("--geometry", default="1600x900", help="virtual screen size (default 1600x900)")
     s.add_argument("--gpu", nargs="?", const="auto", choices=["auto", "intel", "nvidia"],
-                   help="experimental: render on the GPU (OpenGL through virgl); the session can be frozen "
-                        "but not yet restored")
+                   help="experimental: render on the GPU (OpenGL through virgl); its GPU state is saved "
+                        "with the session and rebuilt on restore")
+    s.add_argument("--anyway", action="store_true",
+                   help="start a program that saves its own work in a freezable session regardless")
     s.add_argument("command", nargs=argparse.REMAINDER, help="the program and its arguments")
     s.set_defaults(fn=cmd_run)
 

@@ -61,7 +61,7 @@ stateid diff ID [ID2]       what changed since ID (or between two IDs)
 stateid list | show ID | delete ID     (show latest: the newest state)
 stateid now [--focused]     the summary of the desktop now, without saving
 stateid autosave --enable   save automatically when the windows change (off by default)
-stateid run PROGRAM         start a program whose unsaved work is saved too
+stateid run PROGRAM         start a program whose memory is saved too (work it cannot save)
 stateid config [--init]     privacy settings
 ```
 
@@ -69,7 +69,7 @@ stateid config [--init]     privacy settings
 
 - **Any app:** windows, position and workspace, open documents, working directory, text cursor and a screenshot.
 - **Deeper app state:** OnlyOffice (slide, pen, slideshow), Chromium browsers (tabs), terminals (directories, resumed Claude Code sessions), Nautilus, Evince and VS Code. More apps, other Linux desktops and Windows 11 are planned.
-- **Unsaved work (experimental):** a program started with `stateid run` has its whole memory frozen with [CRIU](https://criu.org) when you save, so unsaved changes come back on restore. Such programs draw without the GPU; `stateid run --gpu` lets OpenGL programs use it through [virgl](https://docs.mesa3d.org/drivers/virgl.html) (tried with Intel and NVIDIA); its relay is built with `cargo` on first use. Its GPU state is saved with the frozen session and rebuilt on restore (tried with an OpenGL demo and GTK 4 apps on NVIDIA and Intel, restoring the same image twice and after a reboot). Vulkan programs draw in software ([lavapipe](https://docs.mesa3d.org/drivers/lavapipe.html)), also with `--gpu`; this was tried with a small Vulkan test program, not yet with real apps.
+- **Work that cannot be saved (experimental):** for programs without a save of their own and for long-running jobs. A program started with `stateid run` has its whole memory frozen with [CRIU](https://criu.org) when you save, so it comes back on restore exactly where it was. Programs that save their own work (LibreOffice, VS Code, GIMP, …) are left to their own saving: `stateid run` refuses them unless you add `--anyway`, and a state tells you when a window had unsaved changes that it does not hold. Programs in these sessions draw without the GPU; `stateid run --gpu` lets OpenGL programs use it through [virgl](https://docs.mesa3d.org/drivers/virgl.html) (tried with Intel and NVIDIA); its relay is built with `cargo` on first use. Its GPU state is saved with the frozen session and rebuilt on restore (tried with an OpenGL demo and GTK 4 apps on NVIDIA and Intel, restoring the same image twice and after a reboot). Vulkan programs draw in software ([lavapipe](https://docs.mesa3d.org/drivers/lavapipe.html)), also with `--gpu`; this was tried with a small Vulkan test program, not yet with real apps.
 
 ## Privacy
 

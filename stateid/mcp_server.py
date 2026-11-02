@@ -113,6 +113,8 @@ def save_state(scope: Literal["desktop", "focused"] = "desktop", window_seq: int
     scope: "desktop" for every window, "focused" for the window the user is working in.
     window_seq: snapshot only this window (from list_windows); overrides scope.
     copy_to_clipboard: also put the ID on the user's clipboard and show a notification.
+    A window marked `unsaved` had unsaved changes that the state does not hold: tell the user to save
+    them in the app if they matter.
     Call get_state with the returned ID for the full details and screenshots."""
     with expected_errors():
         return core.save(window=window_seq, focused=scope == "focused" and window_seq is None,

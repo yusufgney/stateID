@@ -347,7 +347,9 @@ def save(window=None, focused=False, copy=False, screenshots=True, auto=False):
     return {"id": kid, "created": created, "scope": scope, "auto": auto, "excluded_windows": len(excluded_apps),
             "pruned_old_states": len(pruned),
             "windows": [{"app": v["app"], "private": True} if v.get("private") else
-                        {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5]} for v in views]}
+                        {"app": v["app"], "title": v["window"]["title"], "files": v["files"][:5],
+                         **({"unsaved": True} if store.unsaved_lost(st) else {})}
+                        for v, st in zip(views, states)]}
 
 
 def _runnable(cmd):
@@ -476,7 +478,7 @@ def restore(kid):
                                       f"the terminal is still open, so it was not started again")
                 else:
                     i["notes"].append(f"was running in {t['cwd']}: {t['running']} (not re-run)")
-            if st.get("unsaved"):
+            if store.unsaved_lost(st):
                 i["notes"].append("had unsaved changes when saved; check the app's own draft recovery")
 
         focused = next((i for i in items if i["_st"]["window"]["focused"] and i["_win"]), None)

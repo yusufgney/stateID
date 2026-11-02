@@ -173,6 +173,12 @@ def _app_lines(a):
     return out
 
 
+def unsaved_lost(st):
+    """The window showed unsaved changes and its memory was not frozen with the state."""
+    a = st.get("app_state")
+    return bool(st.get("unsaved")) and not (isinstance(a, dict) and a.get("frozen_image"))
+
+
 def agent_md(kid, states, created, excluded=(), screenshots=True):
     """Markdown summary for agents: the focused window first, then every window's documents,
     place in the app and screen text. `states` must already be agent views (see core.agent_view).
@@ -204,8 +210,10 @@ def agent_md(kid, states, created, excluded=(), screenshots=True):
         lines += [f"## {i}. {st['app']} — {w['title']}", ""]
         if tags:
             lines.append(f"- Window: {tags}")
-        if st.get("unsaved"):
-            lines.append("- **Has unsaved changes** (title marker)")
+        if unsaved_lost(st):
+            lines.append("- **Has unsaved changes** (title marker)" + (
+                ": they are not in this state; only the app can save them (or its own draft recovery)"
+                if kid else ""))
         if st["cwd"]:
             lines.append(f"- Working directory: `{st['cwd']}`")
         if st["files"]:
